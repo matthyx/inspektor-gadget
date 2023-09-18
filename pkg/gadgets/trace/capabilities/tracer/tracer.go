@@ -25,7 +25,6 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
-	libseccomp "github.com/seccomp/libseccomp-golang"
 	"github.com/syndtr/gocapability/capability"
 
 	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
@@ -235,10 +234,6 @@ func (t *Tracer) run() {
 		}
 
 		syscall := ""
-		call1 := libseccomp.ScmpSyscall(bpfEvent.Syscall)
-		if name, err := call1.GetName(); err == nil {
-			syscall = name
-		}
 
 		var insetID *bool
 		if bpfEvent.Insetid == 0 {

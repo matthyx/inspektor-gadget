@@ -31,7 +31,6 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
-	libseccomp "github.com/seccomp/libseccomp-golang"
 	log "github.com/sirupsen/logrus"
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
@@ -131,22 +130,6 @@ func (t *Tracer) install() error {
 	})
 	if err != nil {
 		return fmt.Errorf("gathering syscall definitions: %w", err)
-	}
-
-	// Fill the syscall map with specific syscall signatures.
-	syscallsMapSpec := spec.Maps["syscalls"]
-	for name, def := range syscallDefs {
-		nr, err := libseccomp.GetSyscallFromName(name)
-		if err != nil {
-			return fmt.Errorf("getting syscall number of %q: %w", name, err)
-		}
-
-		// We need to do so to avoid taking each time the same address.
-		def := def
-		syscallsMapSpec.Contents = append(syscallsMapSpec.Contents, ebpf.MapKV{
-			Key:   uint64(nr),
-			Value: def,
-		})
 	}
 
 	if err := spec.LoadAndAssign(&t.objs, nil); err != nil {

@@ -19,8 +19,6 @@ package tracer
 
 import (
 	"fmt"
-
-	libseccomp "github.com/seccomp/libseccomp-golang"
 )
 
 // #cgo pkg-config: libseccomp
@@ -28,12 +26,7 @@ import (
 import "C"
 
 func syscallToName(syscall int) string {
-	call1 := libseccomp.ScmpSyscall(syscall)
-	name, err := call1.GetName()
-	if err != nil {
-		name = fmt.Sprintf("syscall%d", syscall)
-	}
-	return name
+	return fmt.Sprintf("syscall%d", syscall)
 }
 
 func codeToName(code uint) string {
