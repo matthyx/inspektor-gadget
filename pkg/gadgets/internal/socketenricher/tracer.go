@@ -72,10 +72,7 @@ func (se *SocketEnricher) start() error {
 		return fmt.Errorf("loading socketsiter asset: %w", err)
 	}
 
-	err = kallsyms.SpecUpdateAddresses(specIter, []string{"socket_file_ops"})
-	if err != nil {
-		return fmt.Errorf("updating socket_file_ops address with ksyms: %w", err)
-	}
+	kallsyms.SpecUpdateAddresses(specIter, []string{"socket_file_ops"})
 
 	opts := ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
