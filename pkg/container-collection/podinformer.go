@@ -54,6 +54,10 @@ func NewPodInformer(node string) (*PodInformer, error) {
 	if err != nil {
 		return nil, err
 	}
+	return NewPodInformerWithConfig(node, config)
+}
+
+func NewPodInformerWithConfig(node string, config *rest.Config) (*PodInformer, error) {
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, err
