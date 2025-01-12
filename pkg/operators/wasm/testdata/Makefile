@@ -9,6 +9,8 @@ TEST_ARTIFACTS = \
 	params \
 	config \
 	map \
+	mapofmap \
+	syscall \
 	#
 
 all: $(TEST_ARTIFACTS)
@@ -16,7 +18,7 @@ all: $(TEST_ARTIFACTS)
 .PHONY: $(TEST_ARTIFACTS)
 $(TEST_ARTIFACTS):
 	@echo "Building $@"
-	@sudo IG_SOURCE_PATH=$(realpath $(ROOT_DIR)/../../../..) $(IG) image build -t $@:latest $@ 
+	@sudo IG_SOURCE_PATH=$(realpath $(ROOT_DIR)/../../../..) $(IG) image build -t $@:latest $@
 	@sudo $(IG) image export $@:latest $@.tar
 	# TODO: This fails with "Error: removing gadget image: unable to reload index:"
 	#@sudo $(IG) image remove $@:latest
