@@ -87,7 +87,7 @@ func NewK8sClient(nodeName string) (*K8sClient, error) {
 	runtimeConfig := &containerutilsTypes.RuntimeConfig{
 		Name:            types.String2RuntimeName(list[0]),
 		SocketPath:      socketPath,
-		RuntimeProtocol: containerutilsTypes.RuntimeProtocolCRI,
+		RuntimeProtocol: "",
 	}
 	runtimeClient, err := containerutils.NewContainerRuntimeClient(runtimeConfig)
 	if err != nil {

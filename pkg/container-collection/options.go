@@ -519,6 +519,7 @@ func WithKubernetesEnrichment(nodeName string, kubeconfig *rest.Config) Containe
 			// Skip enriching if basic k8s fields are already known.
 			// This is an optimization and to make sure to avoid erasing the fields in case of error.
 			if !runtimeclient.IsEnrichedWithK8sMetadata(container.K8s.BasicK8sMetadata) {
+				log.Infof("WithKubernetesEnrichment - enriching container %s with get pods", container.Runtime.ContainerID)
 				var pod *corev1.Pod
 				var err error
 				if container.K8s.PodName == "" || container.K8s.Namespace == "" {
@@ -570,6 +571,8 @@ func WithKubernetesEnrichment(nodeName string, kubeconfig *rest.Config) Containe
 				if container.K8s.PodName != "" && container.K8s.ContainerName == "" {
 					return false
 				}
+			} else {
+				log.Infof("WithKubernetesEnrichment - skipping enriching container %s with get pods", container.Runtime.ContainerID)
 			}
 
 			if container.K8s.ownerReference == nil {
