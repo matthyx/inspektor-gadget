@@ -15,8 +15,12 @@
 package containercollection
 
 import (
+	"reflect"
+	"runtime"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type EventType int
@@ -116,6 +120,7 @@ func (g *GadgetPubSub) Publish(eventType EventType, container *Container) {
 	var wg sync.WaitGroup
 	for _, callback := range copiedSubs {
 		wg.Add(1)
+		done := make(chan struct{})
 		go func(callback FuncNotify) {
 			event := PubSubEvent{
 				Timestamp: time.Now().Format(time.RFC3339),
@@ -123,8 +128,18 @@ func (g *GadgetPubSub) Publish(eventType EventType, container *Container) {
 				Container: container,
 			}
 			callback(event)
-			wg.Done()
+			close(done)
 		}(callback)
+		select {
+		case <-done:
+			// Callback completed
+		case <-time.After(5 * time.Second):
+			// Timeout
+			// FIXME this will leak a goroutine until the callback completes
+			funcName := runtime.FuncForPC(reflect.ValueOf(callback).Pointer()).Name()
+			log.Warnf("Timeout waiting for callback to complete: %v %v %v", funcName, eventType, container)
+		}
+		wg.Done()
 	}
 
 	wg.Wait()
