@@ -19,6 +19,10 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/cilium/ebpf/perf"
+	"github.com/inspektor-gadget/inspektor-gadget/gadgets/trace_open"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+
 	// The runtime is the piece that will run our gadget.
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/runtime/local"
 
@@ -34,8 +38,6 @@ import (
 	// Datasources provide access to the data produced by gadgets and operators.
 	// Import also the json formatter to format the data as json.
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
-	igjson "github.com/inspektor-gadget/inspektor-gadget/pkg/datasource/formatters/json"
-
 	// The gadget context is the glue that connects all components together.
 	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
 )
@@ -49,15 +51,14 @@ func do() error {
 		simple.OnInit(func(gadgetCtx operators.GadgetContext) error {
 			// Subscribe to all datasources and print their output as json the terminal
 			for _, d := range gadgetCtx.GetDataSources() {
-				jsonFormatter, _ := igjson.New(d,
-					// Show all fields
-					igjson.WithShowAll(true),
-
-					// Print json in a pretty format
-					igjson.WithPretty(true, "  "),
-				)
+				reader, err := perf.NewReader(t.objs.randomxMaps.Events, gadgets.PerfBufferPages*os.Getpagesize())
+				if err != nil {
+					return fmt.Errorf("creating perf ring buffer: %w", err)
+				}
 
 				d.Subscribe(func(source datasource.DataSource, data datasource.Data) error {
+					reader.ReadInto()
+					ev := trace_open.Event{}
 					jsonOutput := jsonFormatter.Marshal(data)
 					fmt.Printf("%s\n", jsonOutput)
 					return nil
