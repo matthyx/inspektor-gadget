@@ -88,9 +88,9 @@ func gadgetInit() int32 {
 		}
 
 		// TODO: The datasource doesn't support arrays yet, hence we have to
-		// join the args in a single string. This could be wrong as it's
-		// possible to execute a process with arguments that contain spaces.
-		argsF.SetString(data, strings.Join(args, " "))
+		// join the args in a single string. We are using a non-breaking space
+		// as separator to avoid collisions with arguments that contain spaces.
+		argsF.SetString(data, strings.Join(args, api.ArgsSeparator))
 	}, 0)
 
 	return 0

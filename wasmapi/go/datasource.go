@@ -315,3 +315,6 @@ const (
 	Kind_CString FieldKind = 13
 	Kind_Bytes   FieldKind = 14
 )
+
+// Non-breaking space used to separate function arguments in the "args" field of exec events.
+const ArgsSeparator = string('\u00a0')
