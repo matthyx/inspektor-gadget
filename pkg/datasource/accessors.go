@@ -681,6 +681,27 @@ func (a *fieldAccessor) PutFloat64(data Data, val float64) error {
 }
 
 func (a *fieldAccessor) PutString(data Data, val string) error {
+	if FieldFlagStaticMember.In(a.f.Flags) {
+		if a.f.Kind == api.Kind_String || a.f.Kind == api.Kind_CString {
+			dest := data.payload()[a.f.PayloadIndex][a.f.Offs : a.f.Offs+a.f.Size]
+			n := copy(dest, val)
+			if uint32(n) < a.f.Size {
+				for i := uint32(n); i < a.f.Size; i++ {
+					dest[i] = 0
+				}
+			}
+			return nil
+		}
+	}
+
+	buf := data.payload()[a.f.PayloadIndex]
+	if cap(buf) >= len(val) {
+		newBuf := buf[:len(val)]
+		copy(newBuf, val)
+		data.payload()[a.f.PayloadIndex] = newBuf
+		return nil
+	}
+
 	return a.Set(data, []byte(val))
 }
 
