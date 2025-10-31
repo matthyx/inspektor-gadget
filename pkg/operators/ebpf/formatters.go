@@ -164,13 +164,13 @@ func (i *ebpfInstance) initStackConverter(gadgetCtx operators.GadgetContext) err
 			}
 			in.SetHidden(true, false)
 
-			if kernelSymbolResolver == nil {
-				var err error
-				kernelSymbolResolver, err = kallsyms.NewKAllSyms()
-				if err != nil {
-					return err
-				}
-			}
+			//if kernelSymbolResolver == nil {
+			//	var err error
+			//	kernelSymbolResolver, err = kallsyms.NewKAllSyms()
+			//	if err != nil {
+			//		return err
+			//	}
+			//}
 
 			if i.collectionSpec.Maps[ebpftypes.KernelStackMapName] == nil {
 				return errors.New("kernel stack map is not initialized but used. " +
