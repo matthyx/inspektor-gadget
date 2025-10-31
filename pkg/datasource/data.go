@@ -43,26 +43,139 @@ func (d *dataElement) payload() [][]byte {
 }
 
 func (d *dataElement) DeepCopy() Data {
-	return (*dataElement)(proto.CloneOf((*api.DataElement)(d)))
+	out := &dataElement{}
+	d.DeepCopyInto(out)
+	return out
 }
 
-type data api.GadgetData
+func (d *dataElement) DeepCopyInto(out Data) {
+	if out == nil {
+		return
+	}
+	od, ok := out.(*dataElement)
+	if !ok {
+		return
+	}
+	*od = *d
+	if d.Payload == nil {
+		od.Payload = nil
+		return
+	}
 
-func (d *data) private() {}
+	// Ensure od.Payload has the right length; reuse backing array if possible.
+	if od.Payload == nil || cap(od.Payload) < len(d.Payload) {
+		od.Payload = make([][]byte, len(d.Payload))
+	} else {
+		od.Payload = od.Payload[:len(d.Payload)]
+		// Clear any existing references to avoid keeping old data.
+		for i := range od.Payload {
+			od.Payload[i] = nil
+		}
+	}
 
-func (d *data) payload() [][]byte {
+	for i, b := range d.Payload {
+		if b == nil {
+			od.Payload[i] = nil
+			continue
+		}
+		// Reuse inner slice buffer if capacity is sufficient.
+		ob := od.Payload[i]
+		if ob != nil && cap(ob) >= len(b) {
+			ob = ob[:len(b)]
+			copy(ob, b)
+			od.Payload[i] = ob
+		} else {
+			nb := make([]byte, len(b))
+			copy(nb, b)
+			od.Payload[i] = nb
+		}
+	}
+}
+
+type Edata api.GadgetData
+
+func (d *Edata) private() {}
+
+func (d *Edata) payload() [][]byte {
 	return d.Data.Payload
 }
 
-func (d *data) DeepCopy() Data {
-	return (*data)(proto.CloneOf((*api.GadgetData)(d)))
+func (d *Edata) DeepCopy() Data {
+	out := &Edata{}
+	d.DeepCopyInto(out)
+	return out
 }
 
-func (d *data) SetSeq(seq uint32) {
+func (d *Edata) DeepCopyInto(out Data) {
+	if out == nil {
+		return
+	}
+	od, ok := out.(*Edata)
+	if !ok {
+		return
+	}
+
+	// keep a reference to the destination's Data to allow reusing its payload buffer
+	prevData := od.Data
+	*od = *d
+
+	if d.Data == nil {
+		od.Data = nil
+		return
+	}
+
+	if prevData == nil {
+		prevData = &api.DataElement{}
+	}
+	// preserve prevData.Payload so we can reuse its backing arrays
+	savedPayload := prevData.Payload
+
+	// copy all fields from source data element into prevData
+	*prevData = *d.Data
+	// restore the preserved payload slice (we'll deep-copy into it below)
+	prevData.Payload = savedPayload
+
+	od.Data = prevData
+
+	// deep-copy payload
+	if d.Data.Payload == nil {
+		od.Data.Payload = nil
+		return
+	}
+
+	// Ensure od.Data.Payload has the right length; reuse backing array if possible.
+	if od.Data.Payload == nil || cap(od.Data.Payload) < len(d.Data.Payload) {
+		od.Data.Payload = make([][]byte, len(d.Data.Payload))
+	} else {
+		od.Data.Payload = od.Data.Payload[:len(d.Data.Payload)]
+		for i := range od.Data.Payload {
+			od.Data.Payload[i] = nil
+		}
+	}
+
+	for i, b := range d.Data.Payload {
+		if b == nil {
+			od.Data.Payload[i] = nil
+			continue
+		}
+		ob := od.Data.Payload[i]
+		if ob != nil && cap(ob) >= len(b) {
+			ob = ob[:len(b)]
+			copy(ob, b)
+			od.Data.Payload[i] = ob
+		} else {
+			nb := make([]byte, len(b))
+			copy(nb, b)
+			od.Data.Payload[i] = nb
+		}
+	}
+}
+
+func (d *Edata) SetSeq(seq uint32) {
 	d.Seq = seq
 }
 
-func (d *data) Raw() proto.Message {
+func (d *Edata) Raw() proto.Message {
 	return (*api.GadgetData)(d)
 }
 
@@ -289,7 +402,7 @@ func (ds *dataSource) NewPacketSingle() (PacketSingle, error) {
 		return nil, errors.New("only single data sources can create single packets")
 	}
 
-	return &data{
+	return &Edata{
 		Data: (*api.DataElement)(ds.newDataElement()),
 	}, nil
 }
@@ -299,7 +412,7 @@ func (ds *dataSource) NewPacketSingleFromRaw(b []byte) (PacketSingle, error) {
 		return nil, errors.New("only single data sources can create single packets")
 	}
 
-	data := &data{}
+	data := &Edata{}
 	err := proto.Unmarshal(b, data.Raw())
 	if err != nil {
 		return nil, fmt.Errorf("unmarshaling payload: %w", err)
@@ -600,7 +713,7 @@ func (ds *dataSource) Subscribe(fn DataFunc, priority int) error {
 	switch ds.Type() {
 	case TypeSingle:
 		ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
-			return fn(ds, p.(*data))
+			return fn(ds, p.(*Edata))
 		}})
 	case TypeArray:
 		ds.addSubscription(&subscription{priority: priority, fn: func(source DataSource, p Packet) error {
