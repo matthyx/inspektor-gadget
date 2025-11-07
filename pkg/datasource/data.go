@@ -73,6 +73,11 @@ func (d *EdataElement) DeepCopyInto(out Data) {
 	}
 }
 
+// LostSampleCount is not available at the DataElement level
+func (d *EdataElement) LostSampleCount() uint64 {
+	return 0
+}
+
 type Edata api.GadgetData
 
 func (d *Edata) private() {}
@@ -105,6 +110,10 @@ func (d *Edata) DeepCopyInto(out Data) {
 	}
 
 	(*EdataElement)(d.Data).DeepCopyInto((*EdataElement)(o.Data))
+}
+
+func (d *Edata) LostSampleCount() uint64 {
+	return 0
 }
 
 func (d *Edata) SetSeq(seq uint32) {
