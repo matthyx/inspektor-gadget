@@ -19,11 +19,14 @@
 package kubenameresolver
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/datasource"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-service/api"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/k8sutil"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/operators/common"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/params"
@@ -182,6 +185,14 @@ func (k *KubeNameResolver) InstantiateDataOperator(gadgetCtx operators.GadgetCon
 
 	k8sInventory, err := common.GetK8sInventoryCache()
 	if err != nil {
+		// If kubeconfig is missing, skip operator instead of failing the gadget.
+		// Treat file-not-found (os.ErrNotExist) and similar errors as equivalent
+		// to missing kubeconfig so the gadget can continue running without K8s enrichment.
+		if errors.Is(err, k8sutil.ErrNoKubeConfig) || os.IsNotExist(err) || strings.Contains(strings.ToLower(err.Error()), "no kubeconfig") || strings.Contains(strings.ToLower(err.Error()), "no such file") {
+			logger := gadgetCtx.Logger()
+			logger.Warnf("KubeNameResolver: skipping operator because no kubeconfig was found; enrichment disabled: %v", err)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("creating k8s inventory cache: %w", err)
 	}
 
