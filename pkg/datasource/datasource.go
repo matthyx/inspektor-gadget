@@ -48,6 +48,9 @@ const (
 type Data interface {
 	private()
 	payload() [][]byte
+	// LostSampleCount returns the number of lost samples between this packet and the previous packet; depending on the
+	// data source, this could be per-CPU
+	LostSampleCount() uint64
 }
 
 type DataArray interface {
