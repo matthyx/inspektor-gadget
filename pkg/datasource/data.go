@@ -36,6 +36,10 @@ import (
 
 type dataElement api.DataElement
 
+func (d *dataElement) LostSampleCount() uint64 {
+	return 0
+}
+
 func (d *dataElement) private() {}
 
 func (d *dataElement) payload() [][]byte {
@@ -68,6 +72,10 @@ func (d *dataElement) deepCopyInto(out Data) {
 }
 
 type data api.GadgetData
+
+func (d *data) LostSampleCount() uint64 {
+	return 0
+}
 
 func (d *data) private() {}
 
