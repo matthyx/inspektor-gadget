@@ -340,6 +340,11 @@ func newEcsContainerSelector(params *params.Params) containercollection.Containe
 		// For now, we'll filter by cluster name if provided
 		// Service name filtering can be added later as a parameter
 		// The actual ECS metadata will be populated by the discovery engine
+		if p := params.Get(ParamEcsClusterName); p != nil {
+			if clusterName := p.AsString(); clusterName != "" {
+				containerSelector.Ecs.ClusterName = clusterName
+			}
+		}
 	}
 
 	return containerSelector

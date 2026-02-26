@@ -79,8 +79,17 @@ type Attacher interface {
 type localManager struct {
 	containerCollection *containercollection.ContainerCollection
 	tracerCollection    *tracercollection.TracerCollection
+	externalCollections bool
 
 	fakeContainer *containercollection.Container
+}
+
+func NewLocalManager(containerCollection *containercollection.ContainerCollection, tracerCollection *tracercollection.TracerCollection) *localManager {
+	return &localManager{
+		containerCollection: containerCollection,
+		tracerCollection:    tracerCollection,
+		externalCollections: true,
+	}
 }
 
 func (l *localManager) Name() string {
@@ -168,6 +177,10 @@ func (l *localManager) ParamDescs() params.ParamDescs {
 }
 
 func (l *localManager) Init(operatorParams *params.Params) error {
+	if l.externalCollections {
+		return nil
+	}
+
 	rc := make([]*containerutilsTypes.RuntimeConfig, 0)
 
 	runtimesParam := operatorParams.Get(Runtimes)

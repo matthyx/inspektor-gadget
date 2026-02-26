@@ -69,6 +69,15 @@ type Attacher interface {
 type KubeManager struct {
 	containerCollection *containercollection.ContainerCollection
 	tracerCollection    *tracercollection.TracerCollection
+	externalCollections bool
+}
+
+func NewKubeManager(containerCollection *containercollection.ContainerCollection, tracerCollection *tracercollection.TracerCollection) *KubeManager {
+	return &KubeManager{
+		containerCollection: containerCollection,
+		tracerCollection:    tracerCollection,
+		externalCollections: true,
+	}
 }
 
 func (k *KubeManager) Name() string {
@@ -115,6 +124,10 @@ func (k *KubeManager) ParamDescs() params.ParamDescs {
 }
 
 func (k *KubeManager) Init(params *params.Params) error {
+	if k.externalCollections {
+		return nil
+	}
+
 	hookMode := params.Get(ParamHookMode).AsString()
 	fallbackPodInformer := params.Get(ParamFallbackPodInformer).AsBool()
 	socketPath := params.Get(ParamHookLivenessSocketFile).AsString()
