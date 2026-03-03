@@ -465,6 +465,8 @@ func (ev *EventWrapper) SetPodMetadata(container types.Container) {
 		if ev.hostNetworkAccessor.IsRequested() {
 			if container.UsesHostNetwork() {
 				ev.hostNetworkAccessor.PutInt8(ev.Data, 1)
+			} else {
+				ev.hostNetworkAccessor.PutInt8(ev.Data, 0)
 			}
 		}
 		ownerKindRequest := ev.ownerKindAccessor.IsRequested()
