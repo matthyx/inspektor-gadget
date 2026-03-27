@@ -351,9 +351,6 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		"clusterName",
 		api.Kind_String,
 		datasource.WithTags("ecs"),
-		datasource.WithAnnotations(map[string]string{
-			metadatav1.TemplateAnnotation: "ecsCluster",
-		}),
 		datasource.WithOrder(-20),
 	)
 	if err != nil {
@@ -363,9 +360,6 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		"serviceName",
 		api.Kind_String,
 		datasource.WithTags("ecs"),
-		datasource.WithAnnotations(map[string]string{
-			metadatav1.TemplateAnnotation: "ecsService",
-		}),
 		datasource.WithOrder(-19),
 	)
 	if err != nil {
@@ -375,9 +369,6 @@ func WrapAccessors(source datasource.DataSource, mntnsidAccessor datasource.Fiel
 		"taskFamily",
 		api.Kind_String,
 		datasource.WithTags("ecs"),
-		datasource.WithAnnotations(map[string]string{
-			metadatav1.TemplateAnnotation: "taskFamily",
-		}),
 		datasource.WithOrder(-18),
 	)
 	if err != nil {
