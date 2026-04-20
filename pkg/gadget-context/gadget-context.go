@@ -495,6 +495,12 @@ func (c *GadgetContext) OrasTarget() oras.ReadOnlyTarget {
 	return c.orasTarget
 }
 
+// ReleaseOrasTarget clears the oras target reference after all image operators
+// have finished loading, allowing the OCI store to be garbage collected.
+func (c *GadgetContext) ReleaseOrasTarget() {
+	c.orasTarget = nil
+}
+
 func WithTimeoutOrCancel(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout == 0 {
 		return context.WithCancel(ctx)
