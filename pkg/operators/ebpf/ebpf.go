@@ -343,6 +343,11 @@ func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 		}
 	}
 
+	// Release the raw ELF/BPF object bytes; loadSpec() and addExtraInfo() are
+	// the only callers and both have completed. Holding ~28 MiB per gadget
+	// post-load serves no purpose.
+	i.program = nil
+
 	err = i.analyze(gadgetCtx, i.paramValues)
 	if err != nil {
 		return fmt.Errorf("analyzing: %w", err)
