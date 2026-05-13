@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -221,11 +222,12 @@ type KubeManagerInstance struct {
 	mountnsmap   *ebpf.Map
 	subscribed   bool
 
-	attachedContainers map[string]*containercollection.Container
-	attacher           Attacher
-	params             *params.Params
-	gadgetInstance     any
-	gadgetCtx          operators.GadgetContext
+	attachedContainersMu sync.Mutex
+	attachedContainers   map[string]*containercollection.Container
+	attacher             Attacher
+	params               *params.Params
+	gadgetInstance       any
+	gadgetCtx            operators.GadgetContext
 
 	eventWrappers map[datasource.DataSource]*compat.EventWrapperBase
 
@@ -288,7 +290,9 @@ func (m *KubeManagerInstance) handleGadgetInstance(log logger.Logger) error {
 				return
 			}
 
+			m.attachedContainersMu.Lock()
 			m.attachedContainers[container.Runtime.ContainerID] = container
+			m.attachedContainersMu.Unlock()
 
 			log.Debugf("tracer attached: container %q pid %d mntns %d netns %d",
 				container.K8s.ContainerName, container.ContainerPid(), container.Mntns, container.Netns)
@@ -296,7 +300,9 @@ func (m *KubeManagerInstance) handleGadgetInstance(log logger.Logger) error {
 
 		detachContainerFunc := func(container *containercollection.Container) {
 			log.Debugf("calling gadget.Detach()")
+			m.attachedContainersMu.Lock()
 			delete(m.attachedContainers, container.Runtime.ContainerID)
+			m.attachedContainersMu.Unlock()
 
 			err := attacher.DetachContainer(container)
 			if err != nil {
@@ -358,7 +364,13 @@ func (m *KubeManagerInstance) PostGadgetRun() error {
 		m.manager.containerCollection.Unsubscribe(m.id)
 
 		// emit detach for all remaining containers
+		m.attachedContainersMu.Lock()
+		remaining := make([]*containercollection.Container, 0, len(m.attachedContainers))
 		for _, container := range m.attachedContainers {
+			remaining = append(remaining, container)
+		}
+		m.attachedContainersMu.Unlock()
+		for _, container := range remaining {
 			m.attacher.DetachContainer(container)
 		}
 	}
