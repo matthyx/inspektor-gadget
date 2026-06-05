@@ -498,7 +498,14 @@ func (l *localManagerTrace) PostGadgetRun() error {
 
 		if l.attacher != nil {
 			// emit detach for all remaining containers
+			l.containerMutex.Lock()
+			remaining := make([]*containercollection.Container, 0, len(l.attachedContainers))
 			for container := range l.attachedContainers {
+				remaining = append(remaining, container)
+			}
+			l.containerMutex.Unlock()
+
+			for _, container := range remaining {
 				l.attacher.DetachContainer(container)
 			}
 
