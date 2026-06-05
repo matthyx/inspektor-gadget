@@ -227,7 +227,6 @@ require (
 	github.com/notaryproject/notation-core-go v1.3.0 // indirect
 	github.com/notaryproject/notation-plugin-framework-go v1.0.0 // indirect
 	github.com/notaryproject/tspclient-go v1.0.0 // indirect
-	github.com/peterbourgon/ff/v3 v3.4.0 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/sergi/go-diff v1.3.1 // indirect
 	github.com/veraison/go-cose v1.3.0 // indirect
