@@ -361,15 +361,24 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 
 	if len(unsecuredAttachFilePaths) == 0 {
 		t.logger.Debugf("cannot find file to attach in container %d for symbol %q", containerPid, t.attachSymbol)
+		// Info-level attach signal (diagnostic): the symbol has no resolvable
+		// target in this container — not a shared object in its ld.so.cache and
+		// no absolute OCI argv[0] to fall back to. Emitted at info so SSL uprobe
+		// attachment can be confirmed from normal (non-debug) logs.
+		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: no attach target for symbol %q (searchForLibrary err: %v)", t.progName, containerPid, t.attachSymbol, err)
+		t.containerPid2Inodes[containerPid] = nil
+		return
 	}
 
 	// Fresh attach: the existing set starts empty, so this is union-from-empty.
 	existing := make(map[uint64]bool)
 	var attachedRealInodes []uint64
+	var lastErr error
 	for _, filePath := range unsecuredAttachFilePaths {
 		realInodePtr, added, err := t.attachOneFile(containerPid, filePath, existing)
 		if err != nil {
 			t.logger.Debugf("%s", err.Error())
+			lastErr = err
 			continue
 		}
 		if added {
@@ -379,6 +388,17 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 	}
 
 	t.containerPid2Inodes[containerPid] = attachedRealInodes
+
+	// Info-level attach signal (diagnostic): one line per (program, container)
+	// recording whether the uprobe actually bound. This is the operational signal
+	// that distinguishes a silent attach failure (e.g. opening libssl in the
+	// container's rootfs failing under a given runtime) from a downstream capture
+	// gap — both otherwise present identically as zero events.
+	if len(attachedRealInodes) > 0 {
+		t.logger.Infof("uprobetracer: attached %q to container pid %d at %v", t.progName, containerPid, unsecuredAttachFilePaths)
+	} else {
+		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: resolved %v but bound 0 (symbol absent, or open/link failed: %v)", t.progName, containerPid, unsecuredAttachFilePaths, lastErr)
+	}
 }
 
 // ReattachContainerPid re-resolves the attach target for a container PID and
