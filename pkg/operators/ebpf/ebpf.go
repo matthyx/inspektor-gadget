@@ -25,6 +25,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -141,6 +142,11 @@ func (o *ebpfOperator) InstantiateImageOperator(
 		tcHandlers:     make(map[string]*tchandler.Handler),
 		uprobeTracers:  make(map[string]*uprobetracer.Tracer[api.GadgetData]),
 
+		// Read the caller-supplied map_files matcher (P2b) once at construction.
+		// nil => feature off, no retry timers armed.
+		mappedLibPattern: mappedLibPatternGlobal.Load(),
+		mappedLibTimers:  newMappedLibTimerRegistry(),
+
 		paramValues: paramValues,
 	}
 
@@ -186,6 +192,18 @@ type ebpfInstance struct {
 	networkTracers map[string]*networktracer.Tracer[api.GadgetData]
 	tcHandlers     map[string]*tchandler.Handler
 	uprobeTracers  map[string]*uprobetracer.Tracer[api.GadgetData]
+
+	// mappedLibPattern is the caller-supplied (node-agent) basename matcher for
+	// the Phase-3 (P2b) map_files discovery + attach retry timer. It is read once
+	// at construction from the package-global SetMappedLibPattern. A nil pattern
+	// means the feature is OFF: NO retry timer is ever armed (zero behaviour
+	// change). mappedLibTimers is the per-pid active-timer registry (its own mutex,
+	// never reused from i.mu or a uprobe tracer's t.mu).
+	mappedLibPattern *regexp.Regexp
+	mappedLibTimers  *mappedLibTimerRegistry
+	// mappedLibPass is the per-attempt discovery+attach work for the retry timer.
+	// nil in production (the timer uses i.runMappedLibPass); a test seam only.
+	mappedLibPass func(pid uint32, pattern *regexp.Regexp) bool
 
 	// map from ebpf variable name to ebpfVar struct
 	vars map[string]*ebpfVar
@@ -1003,6 +1021,15 @@ func (i *ebpfInstance) Close(gadgetCtx operators.GadgetContext) error {
 		i.collection = nil
 	}
 
+	// P2b: cancel ALL map_files retry timers and JOIN their goroutines BEFORE
+	// closing the uprobe tracers. The timer goroutines call into the tracers
+	// (acquiring t.mu transiently); cancelAll waits for them without holding any
+	// t.mu, so there is no lock-order inversion and no goroutine outlives the
+	// instance. Safe even when the feature was off (registry is empty).
+	if i.mappedLibTimers != nil {
+		i.mappedLibTimers.cancelAll()
+	}
+
 	for _, networkTracer := range i.networkTracers {
 		networkTracer.Close()
 	}
@@ -1063,6 +1090,15 @@ func (i *ebpfInstance) ReattachContainer(container *containercollection.Containe
 			return err
 		}
 	}
+
+	// P2b: a library like netty-tcnative is dlopen'd seconds AFTER this single
+	// exec event, then unlinked, so the immediate reattach above cannot see it.
+	// When a caller-supplied matcher is set, arm a bounded, self-sustaining retry
+	// timer (deduped per pid) that polls the map_files discovery path until the
+	// lib attaches or the cap is hit. A nil pattern => no timer (feature off).
+	if i.mappedLibPattern != nil {
+		i.armMappedLibTimer(container.ContainerPid())
+	}
 	return nil
 }
 
@@ -1084,6 +1120,11 @@ func (i *ebpfInstance) DetachContainer(container *containercollection.Container)
 			}
 		}
 	}
+
+	// P2b: cancel this pid's map_files retry timer (if any) so a short-lived
+	// container does not leak a goroutine. cancel() only signals via a closed
+	// channel and never joins, so it is safe here (no t.mu held, no blocking).
+	i.mappedLibTimers.cancel(container.ContainerPid())
 
 	for _, uTracer := range i.uprobeTracers {
 		if err := uTracer.DetachContainer(container); err != nil {

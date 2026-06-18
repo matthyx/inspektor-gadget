@@ -37,11 +37,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"golang.org/x/sys/unix"
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/kfilefields"
@@ -116,6 +118,12 @@ type Tracer[Event any] struct {
 	// change the settled executable short-circuits before the open/inode work.
 	containerPid2ExeTarget map[uint32]string
 
+	// mappedLibAttached marks the PIDs for which reattachMappedLibraries has
+	// credited at least one inode via the map_files path. It is the stop signal
+	// for the Phase-3 self-sustaining retry loop (HasMappedLibForPid): once a pid
+	// is in this set the timer can deregister it. Cleared in DetachContainer.
+	mappedLibAttached map[uint32]bool
+
 	logger logger.Logger
 
 	// seams over the impure operations, so the refcount/attach bookkeeping can be
@@ -124,6 +132,10 @@ type Tracer[Event any] struct {
 	openInContainer func(containerPid uint32, filePath string) (*os.File, error)
 	readRealInode   func(fd int) (uint64, error)
 	attachToFile    func(file *os.File) (link.Link, error)
+	// openMapFileFunc is the seam for opening a /proc/<pid>/map_files/<range>
+	// entry. Its signature matches openMapFile in mapfiles.go. Tests inject a
+	// mock to exercise reattachMappedLibraries bookkeeping without /proc access.
+	openMapFileFunc func(containerPid uint32, rangeKey string, expectedMntns uint64) (*os.File, error)
 
 	closed bool
 	mu     sync.Mutex
@@ -136,8 +148,10 @@ func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
 		pendingContainerPids:   make(map[uint32]bool),
 		containerPid2OciConfig: make(map[uint32]string),
 		containerPid2ExeTarget: make(map[uint32]string),
+		mappedLibAttached:      make(map[uint32]bool),
 		openInContainer:        secureopen.OpenInContainer,
 		readRealInode:          kfilefields.ReadRealInodeFromFd,
+		openMapFileFunc:        openMapFile,
 		logger:                 logger,
 		closed:                 false,
 	}
@@ -273,8 +287,41 @@ func (t *Tracer[Event]) containerExecutableFromOCI(containerPid uint32) (string,
 	return exe, true
 }
 
-// attach uprobe program to the inode of the file passed in parameter
+// attachUprobe attaches the uprobe program to the inode of the file passed in.
+//
+// +x gate mitigation (spike note finding): cilium link.OpenExecutable gates on
+// info.Mode()&0111 != 0 ("file is not executable"). netty-tcnative extracts its
+// .so at mode 0600 (no execute bit), so the normal path rejects it. The Linux
+// kernel's uprobe PMU does NOT require the execute bit — bpftrace attaches fine
+// without it (proven on the Phase-0 droplet). When the file lacks any execute
+// bit, we add +x via unix.Fchmod on the already-open fd (mutates the
+// deleted-inode safely; no path, no container-visible change), call
+// OpenExecutable, then RESTORE the original mode. This is flagged for architect
+// review; the alternative (a cilium fork without the userspace mode gate) avoids
+// the mutation entirely but requires a larger diff.
 func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
+	// Detect and temporarily add the execute bit if the file lacks it.
+	fi, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat before attach: %w", err)
+	}
+	origMode := fi.Mode().Perm()
+	needsExecFix := origMode&0o111 == 0
+	if needsExecFix {
+		if err := unix.Fchmod(int(file.Fd()), uint32(origMode)|0o111); err != nil {
+			return nil, fmt.Errorf("fchmod +x on map_files fd (cilium mode gate): %w", err)
+		}
+		// Restore original mode after we are done with OpenExecutable, whether
+		// or not the attach itself succeeds. Accepted: between the two fchmods the
+		// (deleted, container-private) inode transiently carries +x — a sub-ms
+		// window with no filesystem path, so it cannot be exec'd by name.
+		defer func() {
+			if err := unix.Fchmod(int(file.Fd()), uint32(origMode)); err != nil {
+				t.logger.Debugf("uprobetracer: fchmod restore after attach: %v", err)
+			}
+		}()
+	}
+
 	attachPath := path.Join(host.HostProcFs, "self/fd/", fmt.Sprint(file.Fd()))
 	ex, err := link.OpenExecutable(attachPath)
 	if err != nil {
@@ -300,27 +347,27 @@ func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
 	}
 }
 
-// attachOneFile opens filePath inside the container of containerPid, resolves
-// its real (overlayFS-backed) inode and attaches the uprobe to it. It returns
-// the resolved realInodePtr and whether it was newly added to THIS pid's set.
+// attachOneOpenFile is the post-open core of the attach path: given an
+// already-open file (opened by either openInContainer or openMapFile), it
+// resolves the real inode, deduplicates via existing/inodeRefCount, and attaches
+// the uprobe. It is the single implementation of the
 //
-// existing is the set of realInodePtr already counted for this pid; an inode in
-// existing is a no-op (idempotent re-attach). An inode already counted for a
-// DIFFERENT pid only bumps the shared refcount. Caller holds t.mu.
-func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, existing map[uint64]bool) (uint64, bool, error) {
-	// Thankfully, OpenInContainer returns a fd opened without `O_PATH`.
-	// This is necessary because `ReadRealInodeFromFd` needs the
-	// `private_data` field in kernel "struct file", to access the
-	// underlying inode through overlayFS. Using `O_PATH` flag will cause
-	// the `private_data` field to be zero.
-	file, err := t.openInContainer(containerPid, filePath)
-	if err != nil {
-		return 0, false, fmt.Errorf("opening file %q for uprobe: %w", filePath, err)
-	}
+//	readRealInode → existing/inodeRefCount check → attachToFile → containerPid2Inodes[pid] append
+//
+// discipline for BOTH the path-based (P1.5/P2a) and map_files-based (P2b) flows,
+// satisfying Principle 2 (bookkeeping parity). Caller holds t.mu.
+//
+// Returns (realInodePtr, added, error):
+//   - added=true: the inode was newly credited to THIS pid's set (either a fresh
+//     attach or a refcount bump from another pid's already-existing attach).
+//   - added=false + err=nil: the inode was already in `existing` (idempotent
+//     no-op) or attachToFile failed with symbol-absent (non-fatal skip, no ref).
+//   - err != nil: a hard failure (inode read failed); caller logs and skips.
+func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, label string, existing map[uint64]bool) (uint64, bool, error) {
 	realInodePtr, err := t.readRealInode(int(file.Fd()))
 	if err != nil {
 		file.Close()
-		return 0, false, fmt.Errorf("getting inode info for %q: %w", filePath, err)
+		return 0, false, fmt.Errorf("getting inode info for %q: %w", label, err)
 	}
 
 	// Already counted for THIS pid: nothing to do.
@@ -334,22 +381,38 @@ func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, exis
 		// only bump the shared refcount.
 		keeper.counter++
 		file.Close()
-		t.logger.Debugf("uprobe %q already attached for inode of %q; bumped refcount for container %d", t.progName, filePath, containerPid)
+		t.logger.Debugf("uprobe %q already attached for inode of %q; bumped refcount for container %d", t.progName, label, containerPid)
 		return realInodePtr, true, nil
 	}
 
 	progLink, err := t.attachToFile(file)
 	if err != nil {
-		// The target exists but does not export the symbol (e.g. runc, or a
-		// wrapper executable). Skip it without taking a reference, so this inode
-		// is not tracked for the pid and DetachContainer stays balanced.
+		// The target exists but does not export the symbol (e.g. runc, a wrapper
+		// executable, or BoringSSL which omits SSL_read_ex/SSL_write_ex). Skip
+		// without taking a reference so DetachContainer stays balanced.
 		file.Close()
-		t.logger.Debugf("not attaching uprobe %q to %q for container %d: %s", t.progName, filePath, containerPid, err.Error())
+		t.logger.Debugf("not attaching uprobe %q to %q for container %d: %s", t.progName, label, containerPid, err.Error())
 		return realInodePtr, false, nil
 	}
-	t.logger.Debugf("attaching uprobe %q to container %d: %q", t.progName, containerPid, filePath)
+	t.logger.Debugf("attaching uprobe %q to container %d: %q", t.progName, containerPid, label)
 	t.inodeRefCount[realInodePtr] = &inodeKeeper{1, file, progLink}
 	return realInodePtr, true, nil
+}
+
+// attachOneFile opens filePath inside the container of containerPid and then
+// calls attachOneOpenFile. It is the path-based attach entry point used by the
+// P1.5 (dynamic libssl) and P2a (settled-exe) flows; its behaviour is unchanged
+// by the Phase-2 refactor — attachOneOpenFile carries the identical bookkeeping.
+// Caller holds t.mu.
+func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, existing map[uint64]bool) (uint64, bool, error) {
+	// OpenInContainer returns a fd without O_PATH. This is necessary because
+	// ReadRealInodeFromFd needs the private_data field in kernel "struct file"
+	// to reach the underlying inode through overlayFS; O_PATH zeroes that field.
+	file, err := t.openInContainer(containerPid, filePath)
+	if err != nil {
+		return 0, false, fmt.Errorf("opening file %q for uprobe: %w", filePath, err)
+	}
+	return t.attachOneOpenFile(containerPid, file, filePath, existing)
 }
 
 // try attaching to a container, will update `containerPid2Inodes`
@@ -500,6 +563,132 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 	return nil
 }
 
+// reattachMappedLibraries discovers file-backed mappings in
+// /proc/<containerPid>/maps whose basename matches pattern, opens each via
+// /proc/<containerPid>/map_files/<range> (the ONLY route to a deleted, mmap-only
+// inode), and attaches the uprobe using the identical
+// readRealInode → inodeRefCount → containerPid2Inodes bookkeeping as
+// attachOneFile (Principle 2). It is the Phase-2 entry point called by the
+// Phase-3 self-sustaining retry loop.
+//
+// Design invariants (mirror ReattachContainerPid):
+//   - Tracked-pid guard: a pid not in containerPid2Inodes is a no-op (race with
+//     DetachContainer or an event that pre-dates AttachContainer).
+//   - Union-with-delta: existing inodes seeded from containerPid2Inodes[pid] so
+//     a second call for an already-attached inode is a no-op.
+//   - Per-file non-fatal: openMapFile / elfMachineMatchesProcess / inode errors
+//     are logged-and-skipped; only a complete discovery failure is returned.
+//   - Pattern is CALLER-SUPPLIED: the tcnative regex lives in the caller
+//     (node-agent / Phase-3 wiring), not here.
+//
+// Caller holds t.mu.
+func (t *Tracer[Event]) reattachMappedLibraries(containerPid uint32, pattern *regexp.Regexp) error {
+	if t.closed {
+		return errors.New("uprobetracer has been closed")
+	}
+	if t.prog == nil {
+		// Pending mode: no program loaded yet; the create-time attach path
+		// (attachOneFile via attach) will run once AttachProg fires.
+		return nil
+	}
+
+	// Tracked-pid guard: mirrors ReattachContainerPid's identical check.
+	if _, tracked := t.containerPid2Inodes[containerPid]; !tracked {
+		return nil
+	}
+
+	// Capture the mount namespace BEFORE walking maps so we can pass it to
+	// openMapFile for the post-open PID-recycle validation.
+	expectedMntns, err := readProcMntns(containerPid)
+	if err != nil {
+		// PID already gone: not an error, just a teardown race.
+		t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d: mntns read failed (pid gone?): %v", containerPid, err)
+		return nil
+	}
+
+	libs, err := discoverMappedLibraries(containerPid, pattern)
+	if err != nil {
+		return fmt.Errorf("discovering mapped libraries for pid %d: %w", containerPid, err)
+	}
+	if len(libs) == 0 {
+		return nil
+	}
+
+	// Union-with-delta: seed from already-attached inodes for this pid.
+	attachedRealInodes := t.containerPid2Inodes[containerPid]
+	existing := make(map[uint64]bool, len(attachedRealInodes))
+	for _, inode := range attachedRealInodes {
+		existing[inode] = true
+	}
+
+	for _, lib := range libs {
+		file, err := t.openMapFileFunc(containerPid, lib.rangeKey, expectedMntns)
+		if err != nil {
+			// EACCES/EPERM/ENOENT / mntns mismatch / PID race: log and skip.
+			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: open failed: %v", containerPid, lib.path, err)
+			continue
+		}
+
+		// Arch guard: skip .so files whose ELF e_machine does not match the
+		// container process. Non-fatal if the check itself fails (e.g. the
+		// process exe is gone): still try to attach (worst case: symbol absent).
+		if matches, err := elfMachineMatchesProcess(file, containerPid); err != nil {
+			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: arch check failed: %v", containerPid, lib.path, err)
+		} else if !matches {
+			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: ELF e_machine mismatch, skipping", containerPid, lib.path)
+			file.Close()
+			continue
+		}
+
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, file, lib.path, existing)
+		if err != nil {
+			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: attach failed: %v", containerPid, lib.path, err)
+			continue
+		}
+		if added {
+			existing[realInodePtr] = true
+			attachedRealInodes = append(attachedRealInodes, realInodePtr)
+			// Mark the pid as having a map_files-credited inode so
+			// HasMappedLibForPid reports success and the Phase-3 retry loop can
+			// stop. Set on a real attach OR a refcount bump (added==true), since
+			// either means the targeted library is now covered for this pid.
+			t.mappedLibAttached[containerPid] = true
+			t.logger.Infof("uprobetracer: reattachMappedLibraries: attached %q to container pid %d via map_files/%s", t.progName, containerPid, lib.rangeKey)
+		}
+	}
+
+	t.containerPid2Inodes[containerPid] = attachedRealInodes
+	return nil
+}
+
+// ReattachContainerMappedLibsPid is the public, lock-taking entry point to the
+// map_files discovery + attach path (reattachMappedLibraries). It mirrors
+// ReattachContainerPid's locking: it acquires t.mu for the whole read-modify-write
+// so the per-pid inode set and the shared refcount stay consistent. The matcher
+// is CALLER-SUPPLIED (P2b passes the tcnative regex); a nil pattern is a no-op.
+//
+// It is driven by the Phase-3 fork-internal retry timer (ebpfInstance.ReattachContainer)
+// and is safe to call repeatedly: it is idempotent via the union-with-delta
+// existing-set seeding inside reattachMappedLibraries.
+func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid uint32, pattern *regexp.Regexp) error {
+	if pattern == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.reattachMappedLibraries(containerPid, pattern)
+}
+
+// HasMappedLibForPid reports whether reattachMappedLibraries has already credited
+// at least one inode via the map_files path for containerPid. The Phase-3 retry
+// timer polls this to stop once the targeted library (e.g. netty-tcnative) is
+// attached, instead of running to the cap. It is lock-safe.
+func (t *Tracer[Event]) HasMappedLibForPid(containerPid uint32) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.mappedLibAttached[containerPid]
+}
+
 // AttachContainer will attach now if the prog is ready, otherwise it will add container into the pending list
 func (t *Tracer[Event]) AttachContainer(container *containercollection.Container) error {
 	t.mu.Lock()
@@ -540,6 +729,7 @@ func (t *Tracer[Event]) DetachContainer(container *containercollection.Container
 	pid := container.ContainerPid()
 	delete(t.containerPid2OciConfig, pid)
 	delete(t.containerPid2ExeTarget, pid)
+	delete(t.mappedLibAttached, pid)
 	if t.prog == nil {
 		// remove from pending list
 		_, exist := t.pendingContainerPids[pid]
@@ -586,5 +776,6 @@ func (t *Tracer[Event]) Close() {
 	t.containerPid2Inodes = nil
 	t.inodeRefCount = nil
 	t.containerPid2ExeTarget = nil
+	t.mappedLibAttached = nil
 	t.closed = true
 }
