@@ -205,14 +205,26 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 	return nil
 }
 
+// searchForLibrary resolves the attach target paths using the tracer's recorded
+// state. Caller holds t.mu (it reads containerPid2OciConfig). The lock-free hot
+// paths call resolveLibraryPaths directly with snapshotted inputs instead.
 func (t *Tracer[Event]) searchForLibrary(containerPid uint32) ([]string, error) {
-	filePath := t.attachFilePath
-	if filepath.IsAbs(filePath) {
-		return []string{filePath}, nil
+	return t.resolveLibraryPaths(containerPid, t.attachFilePath, t.containerPid2OciConfig[containerPid])
+}
+
+// resolveLibraryPaths resolves the in-container paths to open for the uprobe
+// target from SNAPSHOTTED inputs (attachFilePath and the container's verbatim OCI
+// config), reading no shared tracer state, so it can run WITHOUT holding t.mu.
+// The ld.so.cache parse it performs is I/O that must not be done under the lock
+// (an exec storm holding t.mu across this work starves the create-time
+// AttachContainer that sits on the synchronous container-start path).
+func (t *Tracer[Event]) resolveLibraryPaths(containerPid uint32, attachFilePath, ociConfig string) ([]string, error) {
+	if filepath.IsAbs(attachFilePath) {
+		return []string{attachFilePath}, nil
 	}
 
 	ldCachePath := "/etc/ld.so.cache"
-	ldCachePaths, err := parseLdCache(containerPid, ldCachePath, filePath)
+	ldCachePaths, err := parseLdCache(containerPid, ldCachePath, attachFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("parsing ld cache: %w", err)
 	}
@@ -235,7 +247,7 @@ func (t *Tracer[Event]) searchForLibrary(containerPid uint32) ([]string, error) 
 	// binary, opened via the same OpenInContainer mechanism as a shared library —
 	// so ReadRealInodeFromFd dedup and per-image attach-once are preserved, and
 	// attachUprobe skips (logged) any executable that does not export the symbol.
-	exePath, ok := t.containerExecutableFromOCI(containerPid)
+	exePath, ok := t.executableFromOCIConfig(containerPid, ociConfig)
 	if !ok {
 		return nil, nil
 	}
@@ -269,8 +281,14 @@ func (t *Tracer[Event]) settledExecutablePath(containerPid uint32) (string, bool
 // Node.js and most images, whose runtime resolves the image Entrypoint/Cmd to an
 // absolute path); a relative argv[0] resolved against PATH is a follow-up.
 func (t *Tracer[Event]) containerExecutableFromOCI(containerPid uint32) (string, bool) {
-	ociConfig, ok := t.containerPid2OciConfig[containerPid]
-	if !ok || ociConfig == "" {
+	return t.executableFromOCIConfig(containerPid, t.containerPid2OciConfig[containerPid])
+}
+
+// executableFromOCIConfig is the snapshot-based core of containerExecutableFromOCI:
+// it takes the container's verbatim OCI config as a parameter instead of reading
+// containerPid2OciConfig, so it can run WITHOUT holding t.mu.
+func (t *Tracer[Event]) executableFromOCIConfig(containerPid uint32, ociConfig string) (string, bool) {
+	if ociConfig == "" {
 		return "", false
 	}
 	args, err := containercollection.OCIConfigGetProcessArgs(ociConfig)
@@ -415,6 +433,73 @@ func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, exis
 	return t.attachOneOpenFile(containerPid, file, filePath, existing)
 }
 
+// openedTarget is an opened, not-yet-committed attach candidate produced by the
+// lock-free resolve+open phase of the hot reattach paths. Whoever holds the
+// openedTarget owns its file: commitOpenedTargets consumes it (attachOneOpenFile
+// closes it), and closeOpened releases any dropped on bail.
+type openedTarget struct {
+	file  *os.File
+	label string
+}
+
+// openTargets opens each resolved in-container path WITHOUT holding t.mu — the
+// secureopen.OpenInContainer call (a mount-namespace switch) is the expensive I/O
+// that must stay off the lock. It returns the opened files plus whether any open
+// failed, so a caller's retry guard (e.g. ReattachContainerPid's exe-target
+// record) can avoid latching a target that was not fully attached.
+func (t *Tracer[Event]) openTargets(containerPid uint32, paths []string) ([]openedTarget, bool) {
+	var opened []openedTarget
+	openFailed := false
+	for _, filePath := range paths {
+		// OpenInContainer returns a fd without O_PATH: ReadRealInodeFromFd needs the
+		// kernel "struct file" private_data to reach the overlay's real inode.
+		file, err := t.openInContainer(containerPid, filePath)
+		if err != nil {
+			t.logger.Debugf("opening file %q for uprobe: %v", filePath, err)
+			openFailed = true
+			continue
+		}
+		opened = append(opened, openedTarget{file: file, label: filePath})
+	}
+	return opened, openFailed
+}
+
+// closeOpened releases opened candidates that will not be committed (e.g. the pid
+// was detached during the lock-free I/O window). Safe on a nil/empty slice.
+func closeOpened(opened []openedTarget) {
+	for _, ot := range opened {
+		ot.file.Close()
+	}
+}
+
+// commitOpenedTargets attaches each already-open candidate under t.mu, applying the
+// standard readRealInode → inodeRefCount dedup → containerPid2Inodes bookkeeping via
+// attachOneOpenFile (which consumes/closes every file). Caller holds t.mu and has
+// already re-validated that containerPid is still tracked. Returns whether any
+// candidate hit a hard attach error (for the caller's retry guard).
+func (t *Tracer[Event]) commitOpenedTargets(containerPid uint32, opened []openedTarget) bool {
+	attachedRealInodes := t.containerPid2Inodes[containerPid]
+	existing := make(map[uint64]bool, len(attachedRealInodes))
+	for _, inode := range attachedRealInodes {
+		existing[inode] = true
+	}
+	attachFailed := false
+	for _, ot := range opened {
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, ot.file, ot.label, existing)
+		if err != nil {
+			t.logger.Debugf("%s", err.Error())
+			attachFailed = true
+			continue
+		}
+		if added {
+			existing[realInodePtr] = true
+			attachedRealInodes = append(attachedRealInodes, realInodePtr)
+		}
+	}
+	t.containerPid2Inodes[containerPid] = attachedRealInodes
+	return attachFailed
+}
+
 // try attaching to a container, will update `containerPid2Inodes`
 func (t *Tracer[Event]) attach(containerPid uint32) {
 	unsecuredAttachFilePaths, err := t.searchForLibrary(containerPid)
@@ -483,18 +568,22 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 // exactly one reference — so DetachContainer's decrement-once-per-inode logic
 // stays correct across the create-time attach plus N re-attaches.
 func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
+	// Phase 0 (lock): cheap guards + snapshot the inputs the lock-free resolve
+	// needs. The heavy resolve/open I/O below MUST NOT run under t.mu: an exec
+	// storm holding the lock across it starves the create-time AttachContainer
+	// that sits on the synchronous container-start (fanotify) path and wedges
+	// container starts.
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if t.closed {
+		t.mu.Unlock()
 		return errors.New("uprobetracer has been closed")
 	}
 	if t.prog == nil {
 		// Pending mode: AttachContainer recorded the pid; the create-time attach
 		// path will run searchForLibrary once AttachProg loads the program.
+		t.mu.Unlock()
 		return nil
 	}
-
 	// Tracked-pid guard: AttachContainer keys every live container's init pid in
 	// containerPid2Inodes (even with an empty inode slice when the create-time
 	// attach found no symbol). A Reattach for a pid not in the map means either
@@ -502,20 +591,25 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 	// or the pid was never an AttachContainer target. Either way, fresh-attaching
 	// here would install a uprobe link with no DetachContainer to ever release it.
 	if _, tracked := t.containerPid2Inodes[containerPid]; !tracked {
+		t.mu.Unlock()
 		return nil
 	}
+	attachFilePath := t.attachFilePath
+	ociConfig := t.containerPid2OciConfig[containerPid]
+	lastExeTarget, haveLastExeTarget := t.containerPid2ExeTarget[containerPid]
+	t.mu.Unlock()
 
-	// exe-inode-change guard: if /proc/<pid>/exe still points at the same target
-	// we last *successfully* re-attached for this pid, there is nothing new to
-	// attach. The target is recorded only after a clean pass below, so a transient
-	// failure (e.g. racing an overlayfs mount) is retried on the next exec instead
-	// of being permanently short-circuited.
+	// Phase 1 (NO lock): resolve + open the I/O-heavy attach targets.
+	//
+	// exe-inode-change guard: if /proc/<pid>/exe still points at the target we last
+	// *successfully* re-attached for this pid, there is nothing new to attach. The
+	// target is recorded only after a clean pass below, so a transient failure
+	// (e.g. racing an overlayfs mount) is retried on the next exec instead of being
+	// permanently short-circuited.
 	exeLink := filepath.Join(host.HostProcFs, fmt.Sprint(containerPid), "exe")
 	exeTarget, _ := os.Readlink(exeLink)
-	if exeTarget != "" {
-		if last, ok := t.containerPid2ExeTarget[containerPid]; ok && last == exeTarget {
-			return nil
-		}
+	if exeTarget != "" && haveLastExeTarget && lastExeTarget == exeTarget {
+		return nil
 	}
 
 	// At exec time the settled binary is /proc/<pid>/exe: for statically-linked
@@ -526,38 +620,34 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 	if exe, ok := t.settledExecutablePath(containerPid); ok {
 		unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, exe)
 	}
-	libPaths, err := t.searchForLibrary(containerPid)
+	libPaths, err := t.resolveLibraryPaths(containerPid, attachFilePath, ociConfig)
 	if err != nil {
 		t.logger.Debugf("re-attaching to container %d: %s", containerPid, err.Error())
 	}
 	unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, libPaths...)
 
-	// Union-with-delta: seed the set from the inodes already attached for this
-	// pid, then add only newly-resolved inodes. Holding t.mu across this whole
-	// read-modify-write keeps the per-pid set and the shared refcount consistent.
-	attachedRealInodes := t.containerPid2Inodes[containerPid]
-	existing := make(map[uint64]bool, len(attachedRealInodes))
-	for _, inode := range attachedRealInodes {
-		existing[inode] = true
-	}
-	attachFailed := false
-	for _, filePath := range unsecuredAttachFilePaths {
-		realInodePtr, added, err := t.attachOneFile(containerPid, filePath, existing)
-		if err != nil {
-			t.logger.Debugf("%s", err.Error())
-			attachFailed = true
-			continue
-		}
-		if added {
-			existing[realInodePtr] = true
-			attachedRealInodes = append(attachedRealInodes, realInodePtr)
-		}
-	}
-	t.containerPid2Inodes[containerPid] = attachedRealInodes
+	opened, openFailed := t.openTargets(containerPid, unsecuredAttachFilePaths)
 
-	// Record the settled exe target only after a clean pass so the guard above
-	// does not permanently skip a pid whose attach failed transiently.
-	if exeTarget != "" && !attachFailed {
+	// Phase 2 (lock): re-validate the pid is still tracked — it may have been
+	// detached during the lock-free window, and committing then would leak a uprobe
+	// link with no DetachContainer to release it — then commit the dedup/attach
+	// bookkeeping under the lock.
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		closeOpened(opened)
+		return nil
+	}
+	if _, tracked := t.containerPid2Inodes[containerPid]; !tracked {
+		closeOpened(opened)
+		return nil
+	}
+	attachFailed := t.commitOpenedTargets(containerPid, opened)
+
+	// Record the settled exe target only after a clean pass (no open or attach
+	// failure) so the guard above does not permanently skip a pid whose attach
+	// failed transiently.
+	if exeTarget != "" && !openFailed && !attachFailed {
 		t.containerPid2ExeTarget[containerPid] = exeTarget
 	}
 	return nil
@@ -597,30 +687,53 @@ func (t *Tracer[Event]) reattachMappedLibraries(containerPid uint32, pattern *re
 		return nil
 	}
 
+	// Discover + open under the held lock here (this is the test/integration entry
+	// point; lock-hold time is irrelevant). The production path
+	// (ReattachContainerMappedLibsPid) runs the same discovery OFF the lock.
+	opened, err := t.discoverAndOpenMappedLibraries(containerPid, pattern)
+	if err != nil {
+		closeMappedOpen(opened) // empty today (error precedes the open loop); defensive against future partial-result edits
+		return err
+	}
+	t.commitMappedLibraries(containerPid, opened)
+	return nil
+}
+
+// mappedOpen is an opened, not-yet-committed map_files attach candidate produced by
+// the lock-free discoverAndOpenMappedLibraries. Whoever holds it owns the file:
+// commitMappedLibraries consumes it (attachOneOpenFile closes it), closeMappedOpen
+// releases any dropped on bail.
+type mappedOpen struct {
+	file     *os.File
+	path     string
+	rangeKey string
+}
+
+// discoverAndOpenMappedLibraries performs the I/O-heavy half of the map_files
+// reattach: it captures the container's mount namespace, walks /proc/<pid>/maps for
+// file-backed mappings matching pattern, opens each via map_files, and applies the
+// ELF e_machine arch guard. It reads NO shared tracer state (only the openMapFileFunc
+// seam and the logger), so it runs WITHOUT t.mu — keeping the procfs/ELF I/O off the
+// lock that the create-time AttachContainer path contends for. Returns the opened
+// candidates; the caller commits them (commitMappedLibraries) or releases them
+// (closeMappedOpen) on bail. A complete discovery failure is returned as an error;
+// a teardown race (pid gone) returns (nil, nil).
+func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid uint32, pattern *regexp.Regexp) ([]mappedOpen, error) {
 	// Capture the mount namespace BEFORE walking maps so we can pass it to
 	// openMapFile for the post-open PID-recycle validation.
 	expectedMntns, err := readProcMntns(containerPid)
 	if err != nil {
 		// PID already gone: not an error, just a teardown race.
 		t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d: mntns read failed (pid gone?): %v", containerPid, err)
-		return nil
+		return nil, nil
 	}
 
 	libs, err := discoverMappedLibraries(containerPid, pattern)
 	if err != nil {
-		return fmt.Errorf("discovering mapped libraries for pid %d: %w", containerPid, err)
-	}
-	if len(libs) == 0 {
-		return nil
+		return nil, fmt.Errorf("discovering mapped libraries for pid %d: %w", containerPid, err)
 	}
 
-	// Union-with-delta: seed from already-attached inodes for this pid.
-	attachedRealInodes := t.containerPid2Inodes[containerPid]
-	existing := make(map[uint64]bool, len(attachedRealInodes))
-	for _, inode := range attachedRealInodes {
-		existing[inode] = true
-	}
-
+	var opened []mappedOpen
 	for _, lib := range libs {
 		file, err := t.openMapFileFunc(containerPid, lib.rangeKey, expectedMntns)
 		if err != nil {
@@ -640,25 +753,50 @@ func (t *Tracer[Event]) reattachMappedLibraries(containerPid uint32, pattern *re
 			continue
 		}
 
-		realInodePtr, added, err := t.attachOneOpenFile(containerPid, file, lib.path, existing)
+		opened = append(opened, mappedOpen{file: file, path: lib.path, rangeKey: lib.rangeKey})
+	}
+	return opened, nil
+}
+
+// closeMappedOpen releases opened map_files candidates that will not be committed
+// (e.g. the pid was detached during the lock-free window). Safe on nil/empty.
+func closeMappedOpen(opened []mappedOpen) {
+	for _, mo := range opened {
+		mo.file.Close()
+	}
+}
+
+// commitMappedLibraries attaches each already-open map_files candidate under t.mu,
+// applying the standard readRealInode → inodeRefCount dedup → containerPid2Inodes
+// bookkeeping (via attachOneOpenFile, which consumes/closes every file) and marking
+// mappedLibAttached so HasMappedLibForPid can stop the retry loop. Caller holds t.mu
+// and has re-validated that containerPid is still tracked.
+func (t *Tracer[Event]) commitMappedLibraries(containerPid uint32, opened []mappedOpen) {
+	attachedRealInodes := t.containerPid2Inodes[containerPid]
+	existing := make(map[uint64]bool, len(attachedRealInodes))
+	for _, inode := range attachedRealInodes {
+		existing[inode] = true
+	}
+
+	for _, mo := range opened {
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, mo.file, mo.path, existing)
 		if err != nil {
-			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: attach failed: %v", containerPid, lib.path, err)
+			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: attach failed: %v", containerPid, mo.path, err)
 			continue
 		}
 		if added {
 			existing[realInodePtr] = true
 			attachedRealInodes = append(attachedRealInodes, realInodePtr)
-			// Mark the pid as having a map_files-credited inode so
-			// HasMappedLibForPid reports success and the Phase-3 retry loop can
-			// stop. Set on a real attach OR a refcount bump (added==true), since
-			// either means the targeted library is now covered for this pid.
+			// Mark the pid as having a map_files-credited inode so HasMappedLibForPid
+			// reports success and the Phase-3 retry loop can stop. Set on a real
+			// attach OR a refcount bump (added==true), since either means the
+			// targeted library is now covered for this pid.
 			t.mappedLibAttached[containerPid] = true
-			t.logger.Infof("uprobetracer: reattachMappedLibraries: attached %q to container pid %d via map_files/%s", t.progName, containerPid, lib.rangeKey)
+			t.logger.Infof("uprobetracer: reattachMappedLibraries: attached %q to container pid %d via map_files/%s", t.progName, containerPid, mo.rangeKey)
 		}
 	}
 
 	t.containerPid2Inodes[containerPid] = attachedRealInodes
-	return nil
 }
 
 // ReattachContainerMappedLibsPid is the public, lock-taking entry point to the
@@ -674,9 +812,46 @@ func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid uint32, patt
 	if pattern == nil {
 		return nil
 	}
+
+	// Phase 0 (lock): cheap guards. Same rationale as ReattachContainerPid — the
+	// discover/open I/O below must not hold t.mu, or an exec storm of retry-timer
+	// goroutines starves the create-time AttachContainer on the container-start path.
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return errors.New("uprobetracer has been closed")
+	}
+	if t.prog == nil {
+		t.mu.Unlock()
+		return nil
+	}
+	if _, tracked := t.containerPid2Inodes[containerPid]; !tracked {
+		t.mu.Unlock()
+		return nil
+	}
+	t.mu.Unlock()
+
+	// Phase 1 (NO lock): discover + open the map_files candidates.
+	opened, err := t.discoverAndOpenMappedLibraries(containerPid, pattern)
+	if err != nil {
+		closeMappedOpen(opened) // empty today (error precedes the open loop); defensive against future partial-result edits
+		return err
+	}
+
+	// Phase 2 (lock): re-validate the pid is still tracked (else committing would
+	// leak a uprobe link with no DetachContainer to release it), then commit.
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.reattachMappedLibraries(containerPid, pattern)
+	if t.closed {
+		closeMappedOpen(opened)
+		return nil
+	}
+	if _, tracked := t.containerPid2Inodes[containerPid]; !tracked {
+		closeMappedOpen(opened)
+		return nil
+	}
+	t.commitMappedLibraries(containerPid, opened)
+	return nil
 }
 
 // HasMappedLibForPid reports whether reattachMappedLibraries has already credited
