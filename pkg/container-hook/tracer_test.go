@@ -20,6 +20,7 @@ package containerhook
 import (
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +29,56 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/testutils"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/testing/utils"
 )
+
+// TestCallbackAddContainerBoundedFailsOpen is the create→start guardrail regression
+// test: a stalled AddContainer callback must NOT hold the caller (which gates the
+// fanotify ResponseAllow, i.e. runc create→start) past the hard bound — it fails
+// open so the container start proceeds, while the callback finishes out of band.
+func TestCallbackAddContainerBoundedFailsOpen(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var called atomic.Int32
+	n := &ContainerNotifier{
+		callback: func(ev ContainerEvent) {
+			called.Add(1)
+			close(started)
+			<-release // simulate a stalled callback (e.g. the containerd enricher RPC)
+		},
+	}
+
+	start := time.Now()
+	n.callbackAddContainerBounded(ContainerEvent{Type: EventTypeAddContainer})
+	elapsed := time.Since(start)
+
+	require.Less(t, elapsed, addContainerCallbackHardBound+500*time.Millisecond,
+		"must fail open ~at the hard bound, not block on the stalled callback")
+	require.Equal(t, uint64(1), n.cbBreaches.Load(), "one fail-open breach expected")
+	<-started // happens-before the read below: the callback was invoked, just not awaited
+	require.Equal(t, int32(1), called.Load(), "callback still invoked, just not awaited")
+
+	close(release) // let the background callback finish
+}
+
+// TestCallbackAddContainerBoundedTripsWhenInFlightHigh asserts that when callbacks
+// are already piling up (downstream slow), the guardrail fails open IMMEDIATELY
+// rather than adding another bounded wait to the single fanotify goroutine.
+func TestCallbackAddContainerBoundedTripsWhenInFlightHigh(t *testing.T) {
+	release := make(chan struct{})
+	n := &ContainerNotifier{
+		callback: func(ev ContainerEvent) { <-release },
+	}
+	n.cbInFlight.Store(addContainerCallbackTripThreshold) // already at the trip point
+
+	start := time.Now()
+	n.callbackAddContainerBounded(ContainerEvent{Type: EventTypeAddContainer})
+	elapsed := time.Since(start)
+
+	require.Less(t, elapsed, addContainerCallbackHardBound,
+		"tripped path must fail open immediately, not wait the bound")
+	require.Equal(t, uint64(1), n.cbBreaches.Load())
+
+	close(release) // let the background callback finish
+}
 
 func TestContainerHookEvent(t *testing.T) {
 	utils.RequireRoot(t)
