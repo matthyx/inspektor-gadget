@@ -137,8 +137,38 @@ type Tracer[Event any] struct {
 	// mock to exercise reattachMappedLibraries bookkeeping without /proc access.
 	openMapFileFunc func(containerPid uint32, rangeKey string, expectedMntns uint64) (*os.File, error)
 
+	// Create-time attach (AttachContainer) is dispatched to bounded background
+	// goroutines so it NEVER runs on the synchronous container-start (fanotify
+	// FAN_ACCESS_PERM) path: the AddContainer callback that AttachContainer serves
+	// is awaited before runc's create→start is unblocked, so a slow attach there
+	// (e.g. ELF parse of a large statically-linked binary, or setns) wedges
+	// container starts under a pod burst. attachSem caps how many of those attaches
+	// run concurrently; attachWg lets Close join the in-flight ones.
+	attachSem chan struct{}
+	attachWg  sync.WaitGroup
+	// syncAttach makes AttachContainer run the attach INLINE instead of dispatching
+	// it. Off in production; unit tests set it so create-time bookkeeping is
+	// observable synchronously.
+	syncAttach bool
+
 	closed bool
 	mu     sync.Mutex
+}
+
+// maxConcurrentAttaches caps concurrent background create-time attaches so a
+// pod-burst cannot spawn an unbounded number of simultaneous setns/ELF-parse
+// operations (the resource spike seen in the original wedge incident).
+const maxConcurrentAttaches = 8
+
+// attachJob is the immutable snapshot a background create-time attach needs,
+// captured under t.mu at dispatch so the worker reads no write-once tracer fields
+// off-lock (race-free).
+type attachJob struct {
+	pid            uint32
+	attachFilePath string
+	attachSymbol   string
+	progName       string
+	ociConfig      string
 }
 
 func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
@@ -152,6 +182,7 @@ func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
 		openInContainer:        secureopen.OpenInContainer,
 		readRealInode:          kfilefields.ReadRealInodeFromFd,
 		openMapFileFunc:        openMapFile,
+		attachSem:              make(chan struct{}, maxConcurrentAttaches),
 		logger:                 logger,
 		closed:                 false,
 	}
@@ -864,33 +895,112 @@ func (t *Tracer[Event]) HasMappedLibForPid(containerPid uint32) bool {
 	return t.mappedLibAttached[containerPid]
 }
 
-// AttachContainer will attach now if the prog is ready, otherwise it will add container into the pending list
+// AttachContainer will attach now if the prog is ready, otherwise it will add container into the pending list.
+//
+// When the program is loaded, the actual resolve/open/attach is dispatched to a
+// bounded background goroutine (attachContainerWork) rather than run inline: this
+// callback is awaited on the synchronous container-start (fanotify) path, so doing
+// the I/O here would block runc's create→start under load. AttachContainer instead
+// reserves the pid as tracked and returns immediately. Tests set syncAttach to run
+// the attach inline for deterministic bookkeeping.
 func (t *Tracer[Event]) AttachContainer(container *containercollection.Container) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	pid := container.ContainerPid()
 
+	t.mu.Lock()
 	if t.closed {
+		t.mu.Unlock()
 		return errors.New("uprobetracer has been closed")
 	}
-
-	pid := container.ContainerPid()
-	// Record the OCI config so the (possibly deferred) attach can resolve a
-	// statically-linked symbol to the container's executable via the OCI spec.
+	// Record the OCI config so the attach can resolve a statically-linked symbol to
+	// the container's executable via the OCI spec.
 	t.containerPid2OciConfig[pid] = container.OciConfig
 	if t.prog == nil {
 		_, exist := t.pendingContainerPids[pid]
 		if exist {
+			t.mu.Unlock()
 			return fmt.Errorf("container PID already exists: %d", pid)
 		}
 		t.pendingContainerPids[pid] = true
+		t.mu.Unlock()
+		return nil
+	}
+	if _, exist := t.containerPid2Inodes[pid]; exist {
+		t.mu.Unlock()
+		return fmt.Errorf("container PID already exists: %d", pid)
+	}
+	// Reserve the pid as tracked synchronously so a concurrent Reattach/Detach sees
+	// it and the dup-check above stays authoritative; the attach itself runs off
+	// this path.
+	t.containerPid2Inodes[pid] = nil
+	job := attachJob{pid: pid, attachFilePath: t.attachFilePath, attachSymbol: t.attachSymbol, progName: t.progName, ociConfig: container.OciConfig}
+	runInline := t.syncAttach
+	if !runInline {
+		// Add UNDER the lock so it orders with Close (which sets closed under the
+		// lock before joining attachWg): Close can never miss this attach.
+		t.attachWg.Add(1)
+	}
+	t.mu.Unlock()
+
+	if runInline {
+		t.attachContainerWork(job)
 	} else {
-		_, exist := t.containerPid2Inodes[pid]
-		if exist {
-			return fmt.Errorf("container PID already exists: %d", pid)
-		}
-		t.attach(pid)
+		// One goroutine per container; attachSem bounds how many run the heavy
+		// resolve/open concurrently. Under a burst the excess goroutines briefly
+		// park on the sem — cheap, bounded by the container-start rate, and never
+		// on the container-start path. They bail fast on Close.
+		go func() {
+			defer t.attachWg.Done()
+			t.attachSem <- struct{}{}
+			defer func() { <-t.attachSem }()
+			t.attachContainerWork(job)
+		}()
 	}
 	return nil
+}
+
+// attachContainerWork performs the create-time attach off the container-start path,
+// reusing the optimistic resolve→open (no lock) then re-validate→commit (lock)
+// discipline. It bails if the tracer closed or the pid was detached during the
+// window (closing any opened files), so it can never install a uprobe link with no
+// DetachContainer to release it.
+func (t *Tracer[Event]) attachContainerWork(job attachJob) {
+	t.mu.Lock()
+	if t.closed || t.prog == nil {
+		t.mu.Unlock()
+		return
+	}
+	if _, tracked := t.containerPid2Inodes[job.pid]; !tracked {
+		t.mu.Unlock()
+		return
+	}
+	t.mu.Unlock()
+
+	paths, err := t.resolveLibraryPaths(job.pid, job.attachFilePath, job.ociConfig)
+	if err != nil {
+		t.logger.Debugf("attaching to container %d: %s", job.pid, err.Error())
+	}
+	if len(paths) == 0 {
+		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: no attach target for symbol %q", job.progName, job.pid, job.attachSymbol)
+		return
+	}
+	opened, _ := t.openTargets(job.pid, paths)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		closeOpened(opened)
+		return
+	}
+	if _, tracked := t.containerPid2Inodes[job.pid]; !tracked {
+		closeOpened(opened)
+		return
+	}
+	t.commitOpenedTargets(job.pid, opened)
+	if inodes := t.containerPid2Inodes[job.pid]; len(inodes) > 0 {
+		t.logger.Infof("uprobetracer: attached %q to container pid %d at %v", job.progName, job.pid, paths)
+	} else {
+		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: resolved %v but bound 0 (symbol absent, or open/link failed)", job.progName, job.pid, paths)
+	}
 }
 
 func (t *Tracer[Event]) DetachContainer(container *containercollection.Container) error {
@@ -938,19 +1048,25 @@ func (t *Tracer[Event]) DetachContainer(container *containercollection.Container
 
 func (t *Tracer[Event]) Close() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if t.closed {
+		t.mu.Unlock()
 		return
 	}
+	t.closed = true
+	t.mu.Unlock()
 
+	// Join in-flight background create-time attaches WITHOUT holding t.mu: their
+	// commit phase takes t.mu, so holding it here would deadlock. They observe
+	// closed==true and bail, closing any files they opened.
+	t.attachWg.Wait()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for _, keeper := range t.inodeRefCount {
 		keeper.close()
 	}
-
 	t.containerPid2Inodes = nil
 	t.inodeRefCount = nil
 	t.containerPid2ExeTarget = nil
 	t.mappedLibAttached = nil
-	t.closed = true
 }

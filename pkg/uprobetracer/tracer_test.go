@@ -88,6 +88,9 @@ func newTestTracer(t *testing.T) (*Tracer[any], *testState) {
 	tr.progType = ProgUprobe
 	tr.attachFilePath = "/lib/libtest.so" // absolute => single resolved path
 	tr.attachSymbol = "SSL_write"
+	// Run create-time attach inline so these bookkeeping assertions are
+	// deterministic; production dispatches it to a background goroutine.
+	tr.syncAttach = true
 	tr.openInContainer = st.open
 	tr.readRealInode = st.readInode
 	tr.attachToFile = st.attach
@@ -320,6 +323,123 @@ func TestReattachOpenFailureDoesNotLatchExeTarget(t *testing.T) {
 	}
 	if st.attachCount != 0 {
 		t.Errorf("attachCount = %d, want 0 (every open failed)", st.attachCount)
+	}
+}
+
+// TestAttachContainerDoesNotBlockOnSlowOpen is the regression test for the
+// create-time wedge: AttachContainer must NOT run the resolve/open/attach inline,
+// because it is awaited on the synchronous container-start (fanotify) path — a slow
+// open there freezes runc's create→start under load. It parks the attach's open and
+// asserts AttachContainer still returns promptly, having only reserved the pid.
+func TestAttachContainerDoesNotBlockOnSlowOpen(t *testing.T) {
+	tr, st := newTestTracer(t)
+	tr.syncAttach = false // exercise the production async dispatch path
+	st.currentInode = 100
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	// Park the background attach inside openInContainer.
+	tr.openInContainer = func(pid uint32, path string) (*os.File, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return st.open(pid, path)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- tr.AttachContainer(testContainer(fakePid)) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			close(release)
+			t.Fatalf("AttachContainer: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("AttachContainer blocked on the background attach's slow open (must dispatch off the container-start path)")
+	}
+
+	<-entered // confirm the attach actually dispatched and reached the open
+
+	// The pid must be reserved as tracked the moment AttachContainer returns.
+	tr.mu.Lock()
+	_, tracked := tr.containerPid2Inodes[fakePid]
+	tr.mu.Unlock()
+	if !tracked {
+		close(release)
+		t.Fatal("pid not reserved as tracked after AttachContainer returned")
+	}
+
+	close(release)
+	tr.Close() // joins the in-flight background attach
+}
+
+// parkedOpenTracer returns a tracer in async-attach mode whose openInContainer
+// parks the background attach until release is closed; entered fires once the
+// attach reaches the open.
+func parkedOpenTracer(t *testing.T) (tr *Tracer[any], st *testState, entered, release chan struct{}) {
+	t.Helper()
+	tr, st = newTestTracer(t)
+	tr.syncAttach = false
+	st.currentInode = 100
+	entered = make(chan struct{})
+	release = make(chan struct{})
+	var once sync.Once
+	tr.openInContainer = func(pid uint32, path string) (*os.File, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return st.open(pid, path)
+	}
+	return tr, st, entered, release
+}
+
+// TestAttachContainerDetachDuringInFlightAttach exercises the Phase-2 !tracked bail:
+// a container detached while its create-time attach is mid-open must NOT install a
+// uprobe link (which would have no DetachContainer left to release it).
+func TestAttachContainerDetachDuringInFlightAttach(t *testing.T) {
+	tr, st, entered, release := parkedOpenTracer(t)
+
+	if err := tr.AttachContainer(testContainer(fakePid)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	<-entered // background attach is parked mid-open
+
+	if err := tr.DetachContainer(testContainer(fakePid)); err != nil {
+		t.Fatalf("DetachContainer (reserved pid): %v", err)
+	}
+
+	close(release) // attach proceeds; Phase-2 re-check must see !tracked and bail
+	tr.Close()     // joins the in-flight attach
+
+	if st.attachCount != 0 {
+		t.Errorf("attachCount = %d, want 0 (attach must be dropped after detach-during-attach)", st.attachCount)
+	}
+}
+
+// TestCloseDuringInFlightAttach asserts Close JOINS an in-flight create-time attach
+// without deadlocking and without racing the map teardown (under -race). It does
+// NOT assert attachCount: both orderings are correct — if the attach commits before
+// Close observes closed, Close cleans up the keeper; if closed is observed first,
+// the worker bails. The guarantee is "Close returns, no deadlock, no race".
+func TestCloseDuringInFlightAttach(t *testing.T) {
+	tr, _, entered, release := parkedOpenTracer(t)
+
+	if err := tr.AttachContainer(testContainer(fakePid)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	<-entered // background attach parked mid-open
+
+	closeDone := make(chan struct{})
+	go func() { tr.Close(); close(closeDone) }()
+
+	// Close is now in attachWg.Wait() with the worker parked. Releasing the open
+	// lets the worker finish; Close must then return promptly.
+	close(release)
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return: in-flight attach was not joined")
 	}
 }
 
