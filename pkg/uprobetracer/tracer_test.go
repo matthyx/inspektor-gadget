@@ -20,7 +20,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -293,6 +295,75 @@ func TestReattachAfterCloseErrors(t *testing.T) {
 	tr.Close()
 	if err := tr.ReattachContainerPid(fakePid); err == nil {
 		t.Errorf("ReattachContainerPid after Close should error")
+	}
+}
+
+// TestReattachOpenFailureDoesNotLatchExeTarget asserts that a Phase-1 open failure
+// (e.g. a transient overlayfs-mount race) does NOT record containerPid2ExeTarget, so
+// the next exec retries instead of being permanently short-circuited. Splitting open
+// from attach moved the open error into the new openFailed flag; this guards that the
+// exe-target latch still gates on it, preserving the pre-split semantics.
+func TestReattachOpenFailureDoesNotLatchExeTarget(t *testing.T) {
+	tr, st := newTestTracer(t)
+	st.openErr = errors.New("transient open failure (overlayfs race)")
+
+	// Use self so /proc/<pid>/exe resolves and exeTarget != "" — otherwise the latch
+	// branch is skipped for a missing exe regardless of openFailed.
+	self := uint32(os.Getpid())
+	tr.containerPid2Inodes[self] = nil // tracked
+
+	if err := tr.ReattachContainerPid(self); err != nil {
+		t.Fatalf("ReattachContainerPid: %v", err)
+	}
+	if _, ok := tr.containerPid2ExeTarget[self]; ok {
+		t.Errorf("containerPid2ExeTarget latched despite open failure (would wrongly short-circuit retries)")
+	}
+	if st.attachCount != 0 {
+		t.Errorf("attachCount = %d, want 0 (every open failed)", st.attachCount)
+	}
+}
+
+// TestReattachDoesNotHoldLockDuringIO is the regression test for the container-start
+// wedge: an exec-storm reattach must NOT hold t.mu while it does its resolve/open
+// I/O, or it starves the create-time AttachContainer that sits on the synchronous
+// (fanotify) container-start path and freezes container starts under load. It parks
+// a ReattachContainerPid inside the (now lock-free) open phase and asserts that
+// another t.mu-taking call still completes promptly.
+func TestReattachDoesNotHoldLockDuringIO(t *testing.T) {
+	tr, st := newTestTracer(t)
+	st.currentInode = 100
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	// Park the reattach INSIDE openInContainer — i.e. in the lock-free Phase 1.
+	tr.openInContainer = func(pid uint32, path string) (*os.File, error) {
+		once.Do(func() { close(entered) })
+		<-release
+		return st.open(pid, path)
+	}
+
+	tr.containerPid2Inodes[fakePid] = nil // seed pid as tracked
+
+	done := make(chan error, 1)
+	go func() { done <- tr.ReattachContainerPid(fakePid) }()
+
+	<-entered // reattach is now parked mid-open
+
+	// t.mu MUST be free while the reattach blocks on I/O: a lock-taking call returns
+	// promptly. Before the fix the lock was held across the open and this blocked.
+	got := make(chan bool, 1)
+	go func() { got <- tr.HasMappedLibForPid(fakePid + 1) }()
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("t.mu held during lock-free open phase: HasMappedLibForPid blocked")
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("ReattachContainerPid: %v", err)
 	}
 }
 
