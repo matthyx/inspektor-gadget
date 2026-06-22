@@ -213,13 +213,20 @@ type ContainerNotifier struct {
 	// uprobes can be re-attached once a container settles into its executable.
 	execReader *ringbuf.Reader
 
-	// set to true when the notifier is closed is closed
+	// set to true when the notifier is closed
 	closed atomic.Bool
 	// this channel is used in watchContainersTermination() to avoid having to wait for the
 	// ticker to trigger before returning
 	done chan bool
 
 	wg sync.WaitGroup
+
+	// cbInFlight counts AddContainer callbacks currently running off the fanotify
+	// permission goroutine (see callbackAddContainerBounded). cbBreaches counts how
+	// many times the create→start guardrail failed open. Both are diagnostics;
+	// cbInFlight also drives the trip decision.
+	cbInFlight atomic.Int64
+	cbBreaches atomic.Uint64
 }
 
 var runtimePaths []string = append(
@@ -570,6 +577,63 @@ func (n *ContainerNotifier) watchContainersTermination() {
 	}
 }
 
+const (
+	// addContainerCallbackHardBound caps how long watchPidFileIterate waits for the
+	// AddContainer callback before issuing ResponseAllow anyway. That callback gates
+	// runc's create→start (the deferred ResponseAllow fires only when it returns),
+	// and it runs on a SINGLE goroutine, so an unbounded wait there — e.g. the inline
+	// containerd enricher RPC stalling during a deploy storm on a degraded node —
+	// serializes and wedges every subsequent container start. Past this bound we fail
+	// open: the start proceeds and the callback (collection add + enrichment + uprobe
+	// attach) finishes out of band. A breaching container may be instrumented
+	// slightly late; the node keeps starting containers, which is the right trade.
+	addContainerCallbackHardBound = time.Second
+	// addContainerCallbackTripThreshold is the in-flight AddContainer callback count
+	// past which we stop waiting at all (fail open immediately) rather than add
+	// another bounded wait to the single fanotify goroutine. A growing in-flight
+	// count means downstream is slow and waiting would only serialize the backlog.
+	// Self-resetting: as callbacks drain, normal bounded waiting resumes.
+	addContainerCallbackTripThreshold = 8
+)
+
+// callbackAddContainerBounded runs the AddContainer callback OFF the fanotify
+// permission goroutine with a hard latency bound, so issuing ResponseAllow (which
+// unblocks runc create→start) is never delayed past addContainerCallbackHardBound
+// no matter how slow the callback's enrichment/attach is. Running the callback from
+// a goroutine mirrors the existing async termination callback in
+// watchContainersTermination, and like it these goroutines are not joined on Close.
+// Follow-up: under a PERMANENT downstream stall the background goroutines accumulate
+// unbounded (one per started container) — bound/shed them so a dead containerd sheds
+// load instead of growing toward OOM.
+func (n *ContainerNotifier) callbackAddContainerBounded(event ContainerEvent) {
+	done := make(chan struct{})
+	n.cbInFlight.Add(1)
+	go func() {
+		defer n.cbInFlight.Add(-1)
+		defer close(done)
+		n.callback(event)
+	}()
+
+	// Already piling up → downstream is slow; fail open immediately instead of
+	// serializing another bounded wait on the single fanotify goroutine. (The
+	// Load is advisory — there is a single incrementer, so an exact value is not
+	// required; the trip point is intentionally fuzzy.)
+	if n.cbInFlight.Load() > addContainerCallbackTripThreshold {
+		n.cbBreaches.Add(1)
+		log.Warnf("container-hook: %d AddContainer callbacks in flight (> %d); failing open immediately to keep container starts flowing (breaches=%d)",
+			n.cbInFlight.Load(), addContainerCallbackTripThreshold, n.cbBreaches.Load())
+		return
+	}
+
+	select {
+	case <-done:
+	case <-time.After(addContainerCallbackHardBound):
+		n.cbBreaches.Add(1)
+		log.Warnf("container-hook: AddContainer callback exceeded %s (in-flight=%d, breaches=%d); allowing container start (fail-open)",
+			addContainerCallbackHardBound, n.cbInFlight.Load(), n.cbBreaches.Load())
+	}
+}
+
 func (n *ContainerNotifier) watchPidFileIterate() error {
 	// Get the next event from fanotify.
 	// Even though the API allows to pass skipPIDs, we cannot use
@@ -706,7 +770,10 @@ func (n *ContainerNotifier) watchPidFileIterate() error {
 	delete(n.futureContainers, pc.id)
 	n.futureMu.Unlock()
 
-	n.callback(ContainerEvent{
+	// Bounded so a slow callback (e.g. the inline containerd enricher RPC under a
+	// deploy storm) can never hold runc at the create→start transition past the
+	// hard bound and wedge subsequent container starts on this single goroutine.
+	n.callbackAddContainerBounded(ContainerEvent{
 		Type:            EventTypeAddContainer,
 		ContainerID:     pc.id,
 		ContainerPID:    uint32(containerPID),
