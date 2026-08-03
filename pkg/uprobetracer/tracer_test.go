@@ -41,6 +41,7 @@ type testState struct {
 
 	attachCount int        // number of real uprobe attaches performed
 	openFiles   []*os.File // every file handed out, so the test can clean up
+	lastOffset  *uint64    // pre-resolved file offset seen by the last attach
 }
 
 func (s *testState) open(_ uint32, _ string) (*os.File, error) {
@@ -62,11 +63,12 @@ func (s *testState) readInode(_ int) (uint64, error) {
 	return s.currentInode, nil
 }
 
-func (s *testState) attach(_ *os.File) (link.Link, error) {
+func (s *testState) attach(_ *os.File, offset *uint64) (link.Link, error) {
 	if s.attachErr != nil {
 		return nil, s.attachErr
 	}
 	s.attachCount++
+	s.lastOffset = offset
 	// link.Link cannot be implemented outside cilium/ebpf (unexported method);
 	// keeper.close() tolerates a nil link, so the attach count is the observable
 	// signal for "how many uprobes were really attached".
@@ -561,7 +563,7 @@ func TestReattachMappedLibrariesDedup(t *testing.T) {
 	defer f1.Close()
 	st.openFiles = append(st.openFiles, f1)
 
-	realInode, added, err := tr.attachOneOpenFile(fakePid, f1, "libnetty.so", existing)
+	realInode, added, err := tr.attachOneOpenFile(fakePid, f1, "libnetty.so", nil, existing)
 	if err != nil {
 		t.Fatalf("attachOneOpenFile: %v", err)
 	}
@@ -575,7 +577,7 @@ func TestReattachMappedLibrariesDedup(t *testing.T) {
 	defer f2.Close()
 	st.openFiles = append(st.openFiles, f2)
 
-	_, added2, err := tr.attachOneOpenFile(fakePid, f2, "libnetty.so", existing)
+	_, added2, err := tr.attachOneOpenFile(fakePid, f2, "libnetty.so", nil, existing)
 	if err != nil {
 		t.Fatalf("attachOneOpenFile (2nd): %v", err)
 	}
@@ -612,7 +614,7 @@ func TestReattachMappedLibrariesIdempotent(t *testing.T) {
 	defer f2.Close()
 	st.openFiles = append(st.openFiles, f2)
 
-	_, added, err := tr.attachOneOpenFile(fakePid, f2, "libnetty.so", existing)
+	_, added, err := tr.attachOneOpenFile(fakePid, f2, "libnetty.so", nil, existing)
 	if err != nil {
 		t.Fatalf("attachOneOpenFile: %v", err)
 	}
@@ -641,7 +643,7 @@ func TestReattachMappedLibrariesRefcountBalance(t *testing.T) {
 	f, _ := os.Open(os.DevNull)
 	st.openFiles = append(st.openFiles, f)
 
-	realInode, added, err := tr.attachOneOpenFile(fakePid, f, "libnetty.so", existing)
+	realInode, added, err := tr.attachOneOpenFile(fakePid, f, "libnetty.so", nil, existing)
 	if err != nil || !added {
 		t.Fatalf("attachOneOpenFile: err=%v added=%v, want (nil, true)", err, added)
 	}
@@ -704,7 +706,7 @@ func TestHasMappedLibForPidReflectsAttach(t *testing.T) {
 	existing := make(map[uint64]bool)
 	f, _ := os.Open(os.DevNull)
 	st.openFiles = append(st.openFiles, f)
-	realInode, added, err := tr.attachOneOpenFile(fakePid, f, "libnetty.so", existing)
+	realInode, added, err := tr.attachOneOpenFile(fakePid, f, "libnetty.so", nil, existing)
 	if err != nil || !added {
 		t.Fatalf("attachOneOpenFile: err=%v added=%v", err, added)
 	}
@@ -737,7 +739,7 @@ func TestReattachMappedLibrariesSymbolAbsent(t *testing.T) {
 	f, _ := os.Open(os.DevNull)
 	st.openFiles = append(st.openFiles, f)
 
-	_, added, err := tr.attachOneOpenFile(fakePid, f, "libnetty.so", existing)
+	_, added, err := tr.attachOneOpenFile(fakePid, f, "libnetty.so", nil, existing)
 	if err != nil {
 		t.Fatalf("attachOneOpenFile: unexpected hard error: %v", err)
 	}

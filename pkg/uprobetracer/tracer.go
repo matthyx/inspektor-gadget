@@ -131,11 +131,21 @@ type Tracer[Event any] struct {
 	// implementations in NewTracer and are only overridden in tests.
 	openInContainer func(containerPid uint32, filePath string) (*os.File, error)
 	readRealInode   func(fd int) (uint64, error)
-	attachToFile    func(file *os.File) (link.Link, error)
+	// attachToFile attaches to an already-open candidate. offset is the file
+	// offset resolved during the lock-free open phase, or nil to attach by
+	// symbol name (today's path).
+	attachToFile func(file *os.File, offset *uint64) (link.Link, error)
 	// openMapFileFunc is the seam for opening a /proc/<pid>/map_files/<range>
 	// entry. Its signature matches openMapFile in mapfiles.go. Tests inject a
 	// mock to exercise reattachMappedLibraries bookkeeping without /proc access.
 	openMapFileFunc func(containerPid uint32, rangeKey string, expectedMntns uint64) (*os.File, error)
+
+	// attachOffsetResolver, when registered (SetAttachOffsetResolver), maps an
+	// open candidate to a file offset for attachSymbol, for stripped targets
+	// that export no symbol to attach by name. Consulted ONLY from the
+	// lock-free open phase; see resolveAttachOffset. Write-once before any
+	// container is attached.
+	attachOffsetResolver AttachOffsetResolver
 
 	// Create-time attach (AttachContainer) is dispatched to bounded background
 	// goroutines so it NEVER runs on the synchronous container-start (fanotify
@@ -348,7 +358,11 @@ func (t *Tracer[Event]) executableFromOCIConfig(containerPid uint32, ociConfig s
 // OpenExecutable, then RESTORE the original mode. This is flagged for architect
 // review; the alternative (a cilium fork without the userspace mode gate) avoids
 // the mutation entirely but requires a larger diff.
-func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
+//
+// offset, when non-nil, is a file offset resolved during the lock-free open
+// phase; the uprobe is then bound there instead of by symbol lookup. No ELF or
+// pread work happens here — the caller holds t.mu.
+func (t *Tracer[Event]) attachUprobe(file *os.File, offset *uint64) (link.Link, error) {
 	// Detect and temporarily add the execute bit if the file lacks it.
 	fi, err := file.Stat()
 	if err != nil {
@@ -378,9 +392,9 @@ func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
 	}
 	switch t.progType {
 	case ProgUprobe:
-		return ex.Uprobe(t.attachSymbol, t.prog, nil)
+		return ex.Uprobe(t.attachSymbol, t.prog, uprobeOffsetOptions(offset))
 	case ProgUretprobe:
-		return ex.Uretprobe(t.attachSymbol, t.prog, nil)
+		return ex.Uretprobe(t.attachSymbol, t.prog, uprobeOffsetOptions(offset))
 	case ProgUSDT:
 		attachInfo, err := getUsdtInfo(attachPath, t.attachSymbol)
 		if err != nil {
@@ -412,7 +426,7 @@ func (t *Tracer[Event]) attachUprobe(file *os.File) (link.Link, error) {
 //   - added=false + err=nil: the inode was already in `existing` (idempotent
 //     no-op) or attachToFile failed with symbol-absent (non-fatal skip, no ref).
 //   - err != nil: a hard failure (inode read failed); caller logs and skips.
-func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, label string, existing map[uint64]bool) (uint64, bool, error) {
+func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, label string, offset *uint64, existing map[uint64]bool) (uint64, bool, error) {
 	realInodePtr, err := t.readRealInode(int(file.Fd()))
 	if err != nil {
 		file.Close()
@@ -434,7 +448,7 @@ func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, la
 		return realInodePtr, true, nil
 	}
 
-	progLink, err := t.attachToFile(file)
+	progLink, err := t.attachToFile(file, offset)
 	if err != nil {
 		// The target exists but does not export the symbol (e.g. runc, a wrapper
 		// executable, or BoringSSL which omits SSL_read_ex/SSL_write_ex). Skip
@@ -453,6 +467,12 @@ func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, la
 // P1.5 (dynamic libssl) and P2a (settled-exe) flows; its behaviour is unchanged
 // by the Phase-2 refactor — attachOneOpenFile carries the identical bookkeeping.
 // Caller holds t.mu.
+//
+// This path deliberately does NOT consult the AttachOffsetResolver: it is the
+// only remaining caller that opens under t.mu, and it already bails before
+// reaching a statically-linked target (at create time the library is not in the
+// container's ld.so.cache, so nothing resolves). The omission is a deliberate
+// no-op, not an oversight — revisit only if that bail-out condition changes.
 func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, existing map[uint64]bool) (uint64, bool, error) {
 	// OpenInContainer returns a fd without O_PATH. This is necessary because
 	// ReadRealInodeFromFd needs the private_data field in kernel "struct file"
@@ -461,7 +481,7 @@ func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, exis
 	if err != nil {
 		return 0, false, fmt.Errorf("opening file %q for uprobe: %w", filePath, err)
 	}
-	return t.attachOneOpenFile(containerPid, file, filePath, existing)
+	return t.attachOneOpenFile(containerPid, file, filePath, nil, existing)
 }
 
 // openedTarget is an opened, not-yet-committed attach candidate produced by the
@@ -471,13 +491,19 @@ func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, exis
 type openedTarget struct {
 	file  *os.File
 	label string
+	// offset is the file offset resolved by the AttachOffsetResolver during the
+	// open phase, or nil to attach by symbol name. Carried to the commit phase
+	// so no ELF/pread work is needed under t.mu.
+	offset *uint64
 }
 
 // openTargets opens each resolved in-container path WITHOUT holding t.mu — the
 // secureopen.OpenInContainer call (a mount-namespace switch) is the expensive I/O
-// that must stay off the lock. It returns the opened files plus whether any open
-// failed, so a caller's retry guard (e.g. ReattachContainerPid's exe-target
-// record) can avoid latching a target that was not fully attached.
+// that must stay off the lock, as is the AttachOffsetResolver's ELF parse and
+// pread work, which runs here for the same reason. It returns the opened files
+// plus whether any open failed, so a caller's retry guard (e.g.
+// ReattachContainerPid's exe-target record) can avoid latching a target that was
+// not fully attached.
 func (t *Tracer[Event]) openTargets(containerPid uint32, paths []string) ([]openedTarget, bool) {
 	var opened []openedTarget
 	openFailed := false
@@ -490,7 +516,7 @@ func (t *Tracer[Event]) openTargets(containerPid uint32, paths []string) ([]open
 			openFailed = true
 			continue
 		}
-		opened = append(opened, openedTarget{file: file, label: filePath})
+		opened = append(opened, openedTarget{file: file, label: filePath, offset: t.resolveAttachOffset(file, containerPid)})
 	}
 	return opened, openFailed
 }
@@ -516,7 +542,7 @@ func (t *Tracer[Event]) commitOpenedTargets(containerPid uint32, opened []opened
 	}
 	attachFailed := false
 	for _, ot := range opened {
-		realInodePtr, added, err := t.attachOneOpenFile(containerPid, ot.file, ot.label, existing)
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, ot.file, ot.label, ot.offset, existing)
 		if err != nil {
 			t.logger.Debugf("%s", err.Error())
 			attachFailed = true
@@ -738,6 +764,9 @@ type mappedOpen struct {
 	file     *os.File
 	path     string
 	rangeKey string
+	// offset mirrors openedTarget.offset: resolved in the open phase, consumed
+	// in the commit phase.
+	offset *uint64
 }
 
 // discoverAndOpenMappedLibraries performs the I/O-heavy half of the map_files
@@ -784,7 +813,7 @@ func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid uint32, patt
 			continue
 		}
 
-		opened = append(opened, mappedOpen{file: file, path: lib.path, rangeKey: lib.rangeKey})
+		opened = append(opened, mappedOpen{file: file, path: lib.path, rangeKey: lib.rangeKey, offset: t.resolveAttachOffset(file, containerPid)})
 	}
 	return opened, nil
 }
@@ -810,7 +839,7 @@ func (t *Tracer[Event]) commitMappedLibraries(containerPid uint32, opened []mapp
 	}
 
 	for _, mo := range opened {
-		realInodePtr, added, err := t.attachOneOpenFile(containerPid, mo.file, mo.path, existing)
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, mo.file, mo.path, mo.offset, existing)
 		if err != nil {
 			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: attach failed: %v", containerPid, mo.path, err)
 			continue
