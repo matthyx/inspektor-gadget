@@ -397,6 +397,19 @@ func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 				if err != nil {
 					return fmt.Errorf("creating uprobe tracer: %w", err)
 				}
+				// An embedder can register an AttachOffsetResolver on this
+				// gadget's context to attach uprobes at a file offset instead of
+				// by symbol name (stripped, statically-linked TLS libraries
+				// export no symbol to bind). Reading it from the GadgetContext
+				// scopes it to this gadget instance: vars are per-context, so an
+				// unrelated gadget never picks it up.
+				if v, ok := gadgetCtx.GetVar(uprobetracer.AttachOffsetResolverVar); ok {
+					resolver, err := uprobetracer.AttachOffsetResolverFromVar(v)
+					if err != nil {
+						return fmt.Errorf("registering attach offset resolver: %w", err)
+					}
+					uprobeTracer.SetAttachOffsetResolver(resolver)
+				}
 				i.uprobeTracers[p.Name] = uprobeTracer
 			}
 		case ebpf.SocketFilter:
