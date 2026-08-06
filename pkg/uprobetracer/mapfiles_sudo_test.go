@@ -205,7 +205,14 @@ func runIntegrationWithJVM(t *testing.T, jvmPidVal uint32) {
 	tr.attachSymbol = "SSL_read"
 
 	attachCount := 0
-	tr.attachToFile = func(_ *os.File, _ *uint64) (link.Link, error) { attachCount++; return nil, nil }
+	tr.attachToFile = func(_ *os.File, offsets []uint64) ([]link.Link, error) {
+		attachCount++
+		n := len(offsets)
+		if n == 0 {
+			n = 1
+		}
+		return make([]link.Link, n), nil
+	}
 
 	tr.mu.Lock()
 

@@ -64,18 +64,40 @@ const (
 )
 
 // inodeKeeper holds a file object, with the counter representing its
-// reference count. The link is not nil only when the file is attached.
+// reference count. links is empty only when the file is not attached.
+//
+// counter and len(links) count different things and must not be conflated:
+// counter is how many container PIDs reference this inode, links is how many
+// probe sites are bound in it. One binary attached for three containers is
+// counter=3 with one set of links, because the uprobe is on the inode and the
+// dedup in attachOneOpenFile deliberately attaches only once. Decrementing the
+// refcount therefore never closes an individual link -- links are closed all at
+// once, when the last reference goes away.
 type inodeKeeper struct {
 	counter int
 	file    *os.File
-	link    link.Link
+	links   []link.Link
 }
 
-func (t *inodeKeeper) close() {
-	if t.link != nil {
-		t.link.Close()
+// close releases every link and the file, returning the number of links closed
+// so the caller can account for them. It is idempotent in the sense that it
+// clears links after closing, so a double call cannot double-close.
+func (t *inodeKeeper) close() int {
+	// Counts what it releases, not what it dereferences: a nil entry is
+	// released trivially and still has to balance the attach-side count.
+	// Production never stores a nil link -- attachUprobe returns early on any
+	// bind error -- so there the two readings coincide; test doubles cannot
+	// build a real link.Link (its isLink method is unexported) and store nil.
+	released := len(t.links)
+	for _, l := range t.links {
+		if l != nil {
+			l.Close()
+		}
 	}
+	// Clearing is what makes a second call a no-op rather than a double-close.
+	t.links = nil
 	t.file.Close()
+	return released
 }
 
 type Tracer[Event any] struct {
@@ -134,10 +156,10 @@ type Tracer[Event any] struct {
 	// implementations in NewTracer and are only overridden in tests.
 	openInContainer func(containerPid uint32, filePath string) (*os.File, error)
 	readRealInode   func(fd int) (uint64, error)
-	// attachToFile attaches to an already-open candidate. offset is the file
-	// offset resolved during the lock-free open phase, or nil to attach by
-	// symbol name (today's path).
-	attachToFile func(file *os.File, offset *uint64) (link.Link, error)
+	// attachToFile attaches to an already-open candidate, returning one link per
+	// bound probe site. offsets are the file offsets resolved during the
+	// lock-free open phase, or empty to attach by symbol name.
+	attachToFile func(file *os.File, offsets []uint64) ([]link.Link, error)
 	// openMapFileFunc is the seam for opening a /proc/<pid>/map_files/<range>
 	// entry. Its signature matches openMapFile in mapfiles.go. Tests inject a
 	// mock to exercise reattachMappedLibraries bookkeeping without /proc access.
@@ -166,10 +188,26 @@ type Tracer[Event any] struct {
 	// attempts means the resolver is effectively not working.
 	resolverFailOpen atomic.Uint64
 
-	// multiOffsetUnsupported counts candidates skipped because the resolver
-	// returned more than one offset, which the single-link inodeKeeper cannot
-	// represent yet. See attachOffsets.
-	multiOffsetUnsupported atomic.Uint64
+	// attachRollbacks counts multi-offset attaches abandoned partway: some
+	// offsets bound, a later one failed, and the ones already bound were closed
+	// again. Non-zero means a binary resolved offsets that could not all be
+	// bound, which leaves that target uninstrumented rather than half-probed.
+	attachRollbacks atomic.Uint64
+
+	// linksAttached and linksClosed count every link this tracer has created and
+	// released. They exist to make the invariant that this rework turns on --
+	// every link created is eventually closed exactly once -- checkable rather
+	// than assumed, both in tests and on a running agent. link.Link cannot be
+	// implemented outside cilium/ebpf, so counting at the two sites that create
+	// and destroy links is the only way to observe the lifecycle at all.
+	linksAttached atomic.Uint64
+	linksClosed   atomic.Uint64
+
+	// linksRolledBack counts links bound and then immediately released because a
+	// later offset in the same set failed to bind. They never reach an
+	// inodeKeeper, so they are counted separately rather than muddling the
+	// attached/closed pair whose equality is the leak check.
+	linksRolledBack atomic.Uint64
 
 	// createTimeAttachUnresolved counts create-time (AttachContainer) attaches
 	// that bypassed the resolver entirely; see attachOneFile.
@@ -390,7 +428,7 @@ func (t *Tracer[Event]) executableFromOCIConfig(containerPid uint32, ociConfig s
 // offset, when non-nil, is a file offset resolved during the lock-free open
 // phase; the uprobe is then bound there instead of by symbol lookup. No ELF or
 // pread work happens here — the caller holds t.mu.
-func (t *Tracer[Event]) attachUprobe(file *os.File, offset *uint64) (link.Link, error) {
+func (t *Tracer[Event]) attachUprobe(file *os.File, offsets []uint64) ([]link.Link, error) {
 	// Detect and temporarily add the execute bit if the file lacks it.
 	fi, err := file.Stat()
 	if err != nil {
@@ -418,21 +456,79 @@ func (t *Tracer[Event]) attachUprobe(file *os.File, offset *uint64) (link.Link, 
 	if err != nil {
 		return nil, fmt.Errorf("opening %q: %w", attachPath, err)
 	}
+
+	// USDT takes its attach address from the note section, so a resolver's
+	// offsets do not apply to it and it is always a single probe.
+	if t.progType == ProgUSDT {
+		attachInfo, err := getUsdtInfo(attachPath, t.attachSymbol)
+		if err != nil {
+			return nil, fmt.Errorf("reading USDT metadata: %w", err)
+		}
+		l, err := ex.Uprobe(t.attachSymbol, t.prog,
+			&link.UprobeOptions{
+				Address:      attachInfo.attachAddress,
+				RefCtrOffset: attachInfo.semaphoreAddress,
+			})
+		if err != nil {
+			return nil, err
+		}
+		return []link.Link{l}, nil
+	}
+
+	// No offsets is today's unchanged path: one probe, bound by symbol name.
+	if len(offsets) == 0 {
+		l, err := t.bindProbe(ex, nil)
+		if err != nil {
+			return nil, err
+		}
+		return []link.Link{l}, nil
+	}
+
+	return t.bindAll(offsets, func(offset *uint64) (link.Link, error) {
+		return t.bindProbe(ex, offset)
+	})
+}
+
+// bindAll binds every offset or none.
+//
+// A partially bound program is worse than an unbound one: for the Go crypto/tls
+// read capture, binding the entry probe but not every return produces a stream
+// of started-but-never-completed reads, which reads as data rather than as
+// breakage. So a failure at any offset undoes the ones already bound and
+// reports the error, leaving the caller to take no reference and skip the
+// target entirely.
+//
+// bind is a parameter rather than called directly so this loop -- the one piece
+// of the multi-link path that cannot be reached through the attachToFile test
+// seam, since that seam replaces the whole binder -- is unit-testable.
+func (t *Tracer[Event]) bindAll(offsets []uint64, bind func(offset *uint64) (link.Link, error)) ([]link.Link, error) {
+	links := make([]link.Link, 0, len(offsets))
+	for idx := range offsets {
+		l, err := bind(&offsets[idx])
+		if err != nil {
+			for _, bound := range links {
+				if bound != nil {
+					bound.Close()
+				}
+			}
+			t.linksRolledBack.Add(uint64(len(links)))
+			t.attachRollbacks.Add(1)
+			return nil, fmt.Errorf("binding offset %#x (%d of %d), rolled back %d already bound: %w",
+				offsets[idx], idx+1, len(offsets), len(links), err)
+		}
+		links = append(links, l)
+	}
+	return links, nil
+}
+
+// bindProbe binds one probe, at a file offset when given or by symbol name when
+// not.
+func (t *Tracer[Event]) bindProbe(ex *link.Executable, offset *uint64) (link.Link, error) {
 	switch t.progType {
 	case ProgUprobe:
 		return ex.Uprobe(t.attachSymbol, t.prog, uprobeOffsetOptions(offset))
 	case ProgUretprobe:
 		return ex.Uretprobe(t.attachSymbol, t.prog, uprobeOffsetOptions(offset))
-	case ProgUSDT:
-		attachInfo, err := getUsdtInfo(attachPath, t.attachSymbol)
-		if err != nil {
-			return nil, fmt.Errorf("reading USDT metadata: %w", err)
-		}
-		return ex.Uprobe(t.attachSymbol, t.prog,
-			&link.UprobeOptions{
-				Address:      attachInfo.attachAddress,
-				RefCtrOffset: attachInfo.semaphoreAddress,
-			})
 	default:
 		return nil, fmt.Errorf("attaching to inode: unsupported prog type: %q", t.progType)
 	}
@@ -454,7 +550,7 @@ func (t *Tracer[Event]) attachUprobe(file *os.File, offset *uint64) (link.Link, 
 //   - added=false + err=nil: the inode was already in `existing` (idempotent
 //     no-op) or attachToFile failed with symbol-absent (non-fatal skip, no ref).
 //   - err != nil: a hard failure (inode read failed); caller logs and skips.
-func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, label string, offset *uint64, existing map[uint64]bool) (uint64, bool, error) {
+func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, label string, offsets []uint64, existing map[uint64]bool) (uint64, bool, error) {
 	realInodePtr, err := t.readRealInode(int(file.Fd()))
 	if err != nil {
 		file.Close()
@@ -476,17 +572,19 @@ func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, la
 		return realInodePtr, true, nil
 	}
 
-	progLink, err := t.attachToFile(file, offset)
+	progLinks, err := t.attachToFile(file, offsets)
 	if err != nil {
 		// The target exists but does not export the symbol (e.g. runc, a wrapper
-		// executable, or BoringSSL which omits SSL_read_ex/SSL_write_ex). Skip
+		// executable, or BoringSSL which omits SSL_read_ex/SSL_write_ex), or a
+		// multi-offset attach was rolled back. Either way nothing is bound: skip
 		// without taking a reference so DetachContainer stays balanced.
 		file.Close()
 		t.logger.Debugf("not attaching uprobe %q to %q for container %d: %s", t.progName, label, containerPid, err.Error())
 		return realInodePtr, false, nil
 	}
-	t.logger.Debugf("attaching uprobe %q to container %d: %q", t.progName, containerPid, label)
-	t.inodeRefCount[realInodePtr] = &inodeKeeper{1, file, progLink}
+	t.logger.Debugf("attaching uprobe %q to container %d: %q (%d probe sites)", t.progName, containerPid, label, len(progLinks))
+	t.linksAttached.Add(uint64(len(progLinks)))
+	t.inodeRefCount[realInodePtr] = &inodeKeeper{counter: 1, file: file, links: progLinks}
 	return realInodePtr, true, nil
 }
 
@@ -577,9 +675,18 @@ type TracerStats struct {
 	// ResolverFailOpen counts fall-backs to symbol-name attach after a resolver
 	// declined a candidate.
 	ResolverFailOpen uint64
-	// MultiOffsetUnsupported counts candidates left uninstrumented because the
-	// resolver returned more than one offset.
-	MultiOffsetUnsupported uint64
+	// AttachRollbacks counts multi-offset attaches abandoned partway, with the
+	// already-bound offsets closed again.
+	AttachRollbacks uint64
+	// LinksAttached and LinksClosed track link lifecycle. While a tracer has
+	// live attachments LinksAttached exceeds LinksClosed; after Close they must
+	// be equal, and any gap is a leaked link.
+	LinksAttached uint64
+	LinksClosed   uint64
+	// LinksRolledBack counts links released by an abandoned multi-offset bind.
+	// These never reached a keeper, so they are outside the Attached/Closed
+	// balance.
+	LinksRolledBack uint64
 	// CreateTimeAttachUnresolved counts create-time attaches that bypassed the
 	// resolver.
 	CreateTimeAttachUnresolved uint64
@@ -591,37 +698,11 @@ func (t *Tracer[Event]) Stats() TracerStats {
 	return TracerStats{
 		MuHold:                     t.muHold.Stats(),
 		ResolverFailOpen:           t.resolverFailOpen.Load(),
-		MultiOffsetUnsupported:     t.multiOffsetUnsupported.Load(),
+		AttachRollbacks:            t.attachRollbacks.Load(),
+		LinksAttached:              t.linksAttached.Load(),
+		LinksClosed:                t.linksClosed.Load(),
+		LinksRolledBack:            t.linksRolledBack.Load(),
 		CreateTimeAttachUnresolved: t.createTimeAttachUnresolved.Load(),
-	}
-}
-
-// attachOffsets narrows a resolved offset slice to the single offset the
-// current inodeKeeper can hold, reporting whether the candidate may be attached
-// at all.
-//
-// An empty slice means "attach by symbol name", today's unchanged behaviour.
-// More than one offset is refused rather than truncated: inodeKeeper carries one
-// link.Link per inode, so attaching only the first would bind some of a
-// program's probe sites and silently drop the rest -- for the Go crypto/tls
-// Read capture that is an entry probe with no returns, which produces a stream
-// of started-but-never-completed reads rather than an obvious failure. Refusing
-// loudly leaves the target uninstrumented, which is recoverable; a half-attached
-// program is not.
-//
-// Multi-offset attach lands with the multi-link inodeKeeper rework, at which
-// point this narrowing disappears rather than being extended.
-func (t *Tracer[Event]) attachOffsets(offsets []uint64, label string) (*uint64, bool) {
-	switch len(offsets) {
-	case 0:
-		return nil, true
-	case 1:
-		return &offsets[0], true
-	default:
-		t.multiOffsetUnsupported.Add(1)
-		t.logger.Warnf("uprobetracer: %q NOT attached to %q: resolver returned %d offsets but only one link per inode is supported yet; leaving the target uninstrumented rather than attaching a subset",
-			t.progName, label, len(offsets))
-		return nil, false
 	}
 }
 
@@ -640,13 +721,7 @@ func (t *Tracer[Event]) commitOpenedTargets(containerPid uint32, opened []opened
 	}
 	attachFailed := false
 	for _, ot := range opened {
-		offset, ok := t.attachOffsets(ot.offsets, ot.label)
-		if !ok {
-			// attachOneOpenFile would have consumed the file; this path must.
-			ot.file.Close()
-			continue
-		}
-		realInodePtr, added, err := t.attachOneOpenFile(containerPid, ot.file, ot.label, offset, existing)
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, ot.file, ot.label, ot.offsets, existing)
 		if err != nil {
 			t.logger.Debugf("%s", err.Error())
 			attachFailed = true
@@ -943,12 +1018,7 @@ func (t *Tracer[Event]) commitMappedLibraries(containerPid uint32, opened []mapp
 	}
 
 	for _, mo := range opened {
-		offset, ok := t.attachOffsets(mo.offsets, mo.path)
-		if !ok {
-			mo.file.Close()
-			continue
-		}
-		realInodePtr, added, err := t.attachOneOpenFile(containerPid, mo.file, mo.path, offset, existing)
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, mo.file, mo.path, mo.offsets, existing)
 		if err != nil {
 			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: attach failed: %v", containerPid, mo.path, err)
 			continue
@@ -1175,7 +1245,10 @@ func (t *Tracer[Event]) DetachContainer(container *containercollection.Container
 			}
 			keeper.counter--
 			if keeper.counter == 0 {
-				keeper.close()
+				// Only the LAST reference closes the links. A decrement that
+				// leaves other PIDs referencing this inode must not touch them,
+				// or those containers silently lose instrumentation.
+				t.linksClosed.Add(uint64(keeper.close()))
 				delete(t.inodeRefCount, realInodePtr)
 			}
 		}
@@ -1201,7 +1274,7 @@ func (t *Tracer[Event]) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, keeper := range t.inodeRefCount {
-		keeper.close()
+		t.linksClosed.Add(uint64(keeper.close()))
 	}
 	t.containerPid2Inodes = nil
 	t.inodeRefCount = nil
