@@ -144,8 +144,8 @@ func TestMapFilesResolvesOffset(t *testing.T) {
 		t.Fatal("resolver was never called from the map_files open phase")
 	}
 	for _, mo := range opened {
-		if mo.offset == nil || *mo.offset != wantOffset {
-			t.Errorf("mappedOpen %q offset = %v, want %#x", mo.path, mo.offset, wantOffset)
+		if len(mo.offsets) != 1 || mo.offsets[0] != wantOffset {
+			t.Errorf("mappedOpen %q offsets = %v, want [%#x]", mo.path, mo.offsets, wantOffset)
 		}
 	}
 }

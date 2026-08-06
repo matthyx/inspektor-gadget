@@ -57,6 +57,7 @@ import (
 	runtimefinder "github.com/inspektor-gadget/inspektor-gadget/pkg/container-hook/runtime-finder"
 	containerutils "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/histogram"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/kallsyms/symscache"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/kfilefields"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
@@ -227,7 +228,45 @@ type ContainerNotifier struct {
 	// cbInFlight also drives the trip decision.
 	cbInFlight atomic.Int64
 	cbBreaches atomic.Uint64
+	// cbDuration records how long the AddContainer callback actually took,
+	// measured inside the callback goroutine rather than around the bounded
+	// wait. That distinction is the whole point: the bounded wait tells you only
+	// that a callback exceeded addContainerCallbackHardBound, never by how much,
+	// so it cannot answer whether the system is comfortably inside its budget or
+	// one slow dependency away from breaching. See CallbackStats.
+	cbDuration histogram.Recorder
 }
+
+// CallbackStats is a point-in-time view of the AddContainer create→start
+// guardrail, for embedders that need to hold the attach path to a latency
+// budget rather than discover breaches from logs after the fact.
+type CallbackStats struct {
+	// InFlight is the number of AddContainer callbacks running right now.
+	InFlight int64
+	// Breaches counts every fail-open since start: both the immediate trip on a
+	// high in-flight count and the hard-bound timeout.
+	Breaches uint64
+	// Duration describes how long callbacks actually took, including those that
+	// outran the bound. Compare its Quantile against
+	// AddContainerCallbackHardBound to see the headroom.
+	Duration histogram.Stats
+}
+
+// CallbackStats returns a snapshot of the guardrail's counters. Safe to call at
+// any time from any goroutine; it takes no lock and never blocks the attach
+// path.
+func (n *ContainerNotifier) CallbackStats() CallbackStats {
+	return CallbackStats{
+		InFlight: n.cbInFlight.Load(),
+		Breaches: n.cbBreaches.Load(),
+		Duration: n.cbDuration.Stats(),
+	}
+}
+
+// AddContainerCallbackHardBound exposes the guardrail's latency bound so an
+// embedder's budget can be expressed relative to it ("p99 under half the
+// bound") instead of duplicating the constant and silently drifting from it.
+func AddContainerCallbackHardBound() time.Duration { return addContainerCallbackHardBound }
 
 var runtimePaths []string = append(
 	runtimefinder.RuntimePaths,
@@ -611,6 +650,12 @@ func (n *ContainerNotifier) callbackAddContainerBounded(event ContainerEvent) {
 	go func() {
 		defer n.cbInFlight.Add(-1)
 		defer close(done)
+		// Timed here, not around the select below, so the recorded duration is
+		// the callback's own cost. A callback that outruns the hard bound still
+		// reports its true duration rather than being censored at the bound,
+		// which is what makes the distribution usable as a budget gate.
+		start := time.Now()
+		defer func() { n.cbDuration.ObserveSince(start) }()
 		n.callback(event)
 	}()
 

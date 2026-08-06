@@ -40,12 +40,15 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/histogram"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/kfilefields"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
@@ -140,12 +143,37 @@ type Tracer[Event any] struct {
 	// mock to exercise reattachMappedLibraries bookkeeping without /proc access.
 	openMapFileFunc func(containerPid uint32, rangeKey string, expectedMntns uint64) (*os.File, error)
 
-	// attachOffsetResolver, when registered (SetAttachOffsetResolver), maps an
-	// open candidate to a file offset for attachSymbol, for stripped targets
-	// that export no symbol to attach by name. Consulted ONLY from the
-	// lock-free open phase; see resolveAttachOffset. Write-once before any
-	// container is attached.
-	attachOffsetResolver AttachOffsetResolver
+	// attachOffsetsResolver, when registered (SetAttachOffsetResolver or
+	// SetAttachOffsetsResolver), maps an open candidate to the file offsets for
+	// attachSymbol, for stripped targets that export no symbol to attach by
+	// name. Consulted ONLY from the lock-free open phase; see
+	// resolveAttachOffsets. Write-once before any container is attached.
+	attachOffsetsResolver AttachOffsetsResolver
+
+	// muHold records how long commitOpenedTargets spends holding t.mu.
+	//
+	// This lock serializes the create-time attach that gates runc's create→start,
+	// so its tail hold time is the quantity that decides whether an exec storm
+	// stalls container starts on the node. It is recorded rather than merely
+	// logged on breach because "did we stay inside budget" is not answerable from
+	// breach logs alone -- those only appear once the damage is done.
+	muHold histogram.Recorder
+
+	// resolverFailOpen counts how many times a registered resolver declined a
+	// candidate (error or no offsets) and the tracer fell back to symbol-name
+	// attach. Non-zero is normal -- the resolver is consulted for every candidate
+	// including ones it has no opinion on -- but a rate that tracks total attach
+	// attempts means the resolver is effectively not working.
+	resolverFailOpen atomic.Uint64
+
+	// multiOffsetUnsupported counts candidates skipped because the resolver
+	// returned more than one offset, which the single-link inodeKeeper cannot
+	// represent yet. See attachOffsets.
+	multiOffsetUnsupported atomic.Uint64
+
+	// createTimeAttachUnresolved counts create-time (AttachContainer) attaches
+	// that bypassed the resolver entirely; see attachOneFile.
+	createTimeAttachUnresolved atomic.Uint64
 
 	// Create-time attach (AttachContainer) is dispatched to bounded background
 	// goroutines so it NEVER runs on the synchronous container-start (fanotify
@@ -481,6 +509,16 @@ func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, exis
 	if err != nil {
 		return 0, false, fmt.Errorf("opening file %q for uprobe: %w", filePath, err)
 	}
+	// Counted, not just commented: the claim that this path never meets a target
+	// needing an offset is an assumption about what is reachable at create time,
+	// and an assumption on a fail-open path is exactly the kind that stops being
+	// true quietly. A registered resolver plus a rising count here is the signal
+	// that the omission has started costing coverage.
+	if t.attachOffsetsResolver != nil {
+		t.createTimeAttachUnresolved.Add(1)
+		t.logger.Debugf("uprobetracer: %q create-time attach to %q for container %d bypassed the offset resolver (count=%d)",
+			t.progName, filePath, containerPid, t.createTimeAttachUnresolved.Load())
+	}
 	return t.attachOneOpenFile(containerPid, file, filePath, nil, existing)
 }
 
@@ -491,10 +529,10 @@ func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, exis
 type openedTarget struct {
 	file  *os.File
 	label string
-	// offset is the file offset resolved by the AttachOffsetResolver during the
-	// open phase, or nil to attach by symbol name. Carried to the commit phase
-	// so no ELF/pread work is needed under t.mu.
-	offset *uint64
+	// offsets are the file offsets resolved by the AttachOffsetsResolver during
+	// the open phase, or empty to attach by symbol name. Carried to the commit
+	// phase so no ELF/pread work is needed under t.mu.
+	offsets []uint64
 }
 
 // openTargets opens each resolved in-container path WITHOUT holding t.mu — the
@@ -516,7 +554,7 @@ func (t *Tracer[Event]) openTargets(containerPid uint32, paths []string) ([]open
 			openFailed = true
 			continue
 		}
-		opened = append(opened, openedTarget{file: file, label: filePath, offset: t.resolveAttachOffset(file, containerPid)})
+		opened = append(opened, openedTarget{file: file, label: filePath, offsets: t.resolveAttachOffsets(file, containerPid)})
 	}
 	return opened, openFailed
 }
@@ -529,12 +567,72 @@ func closeOpened(opened []openedTarget) {
 	}
 }
 
+// TracerStats is a point-in-time view of the attach path's cost and of the
+// offset resolver's effectiveness, for embedders holding the attach path to a
+// latency budget.
+type TracerStats struct {
+	// MuHold describes how long commitOpenedTargets held t.mu. This is the
+	// budgeted quantity: t.mu serializes the attach that gates container starts.
+	MuHold histogram.Stats
+	// ResolverFailOpen counts fall-backs to symbol-name attach after a resolver
+	// declined a candidate.
+	ResolverFailOpen uint64
+	// MultiOffsetUnsupported counts candidates left uninstrumented because the
+	// resolver returned more than one offset.
+	MultiOffsetUnsupported uint64
+	// CreateTimeAttachUnresolved counts create-time attaches that bypassed the
+	// resolver.
+	CreateTimeAttachUnresolved uint64
+}
+
+// Stats returns a snapshot. It takes no lock -- deliberately, since a stats read
+// that waited on t.mu could not be used to diagnose t.mu being held too long.
+func (t *Tracer[Event]) Stats() TracerStats {
+	return TracerStats{
+		MuHold:                     t.muHold.Stats(),
+		ResolverFailOpen:           t.resolverFailOpen.Load(),
+		MultiOffsetUnsupported:     t.multiOffsetUnsupported.Load(),
+		CreateTimeAttachUnresolved: t.createTimeAttachUnresolved.Load(),
+	}
+}
+
+// attachOffsets narrows a resolved offset slice to the single offset the
+// current inodeKeeper can hold, reporting whether the candidate may be attached
+// at all.
+//
+// An empty slice means "attach by symbol name", today's unchanged behaviour.
+// More than one offset is refused rather than truncated: inodeKeeper carries one
+// link.Link per inode, so attaching only the first would bind some of a
+// program's probe sites and silently drop the rest -- for the Go crypto/tls
+// Read capture that is an entry probe with no returns, which produces a stream
+// of started-but-never-completed reads rather than an obvious failure. Refusing
+// loudly leaves the target uninstrumented, which is recoverable; a half-attached
+// program is not.
+//
+// Multi-offset attach lands with the multi-link inodeKeeper rework, at which
+// point this narrowing disappears rather than being extended.
+func (t *Tracer[Event]) attachOffsets(offsets []uint64, label string) (*uint64, bool) {
+	switch len(offsets) {
+	case 0:
+		return nil, true
+	case 1:
+		return &offsets[0], true
+	default:
+		t.multiOffsetUnsupported.Add(1)
+		t.logger.Warnf("uprobetracer: %q NOT attached to %q: resolver returned %d offsets but only one link per inode is supported yet; leaving the target uninstrumented rather than attaching a subset",
+			t.progName, label, len(offsets))
+		return nil, false
+	}
+}
+
 // commitOpenedTargets attaches each already-open candidate under t.mu, applying the
 // standard readRealInode → inodeRefCount dedup → containerPid2Inodes bookkeeping via
 // attachOneOpenFile (which consumes/closes every file). Caller holds t.mu and has
 // already re-validated that containerPid is still tracked. Returns whether any
 // candidate hit a hard attach error (for the caller's retry guard).
 func (t *Tracer[Event]) commitOpenedTargets(containerPid uint32, opened []openedTarget) bool {
+	defer t.muHold.ObserveSince(time.Now())
+
 	attachedRealInodes := t.containerPid2Inodes[containerPid]
 	existing := make(map[uint64]bool, len(attachedRealInodes))
 	for _, inode := range attachedRealInodes {
@@ -542,7 +640,13 @@ func (t *Tracer[Event]) commitOpenedTargets(containerPid uint32, opened []opened
 	}
 	attachFailed := false
 	for _, ot := range opened {
-		realInodePtr, added, err := t.attachOneOpenFile(containerPid, ot.file, ot.label, ot.offset, existing)
+		offset, ok := t.attachOffsets(ot.offsets, ot.label)
+		if !ok {
+			// attachOneOpenFile would have consumed the file; this path must.
+			ot.file.Close()
+			continue
+		}
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, ot.file, ot.label, offset, existing)
 		if err != nil {
 			t.logger.Debugf("%s", err.Error())
 			attachFailed = true
@@ -764,9 +868,9 @@ type mappedOpen struct {
 	file     *os.File
 	path     string
 	rangeKey string
-	// offset mirrors openedTarget.offset: resolved in the open phase, consumed
+	// offsets mirrors openedTarget.offsets: resolved in the open phase, consumed
 	// in the commit phase.
-	offset *uint64
+	offsets []uint64
 }
 
 // discoverAndOpenMappedLibraries performs the I/O-heavy half of the map_files
@@ -813,7 +917,7 @@ func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid uint32, patt
 			continue
 		}
 
-		opened = append(opened, mappedOpen{file: file, path: lib.path, rangeKey: lib.rangeKey, offset: t.resolveAttachOffset(file, containerPid)})
+		opened = append(opened, mappedOpen{file: file, path: lib.path, rangeKey: lib.rangeKey, offsets: t.resolveAttachOffsets(file, containerPid)})
 	}
 	return opened, nil
 }
@@ -839,7 +943,12 @@ func (t *Tracer[Event]) commitMappedLibraries(containerPid uint32, opened []mapp
 	}
 
 	for _, mo := range opened {
-		realInodePtr, added, err := t.attachOneOpenFile(containerPid, mo.file, mo.path, mo.offset, existing)
+		offset, ok := t.attachOffsets(mo.offsets, mo.path)
+		if !ok {
+			mo.file.Close()
+			continue
+		}
+		realInodePtr, added, err := t.attachOneOpenFile(containerPid, mo.file, mo.path, offset, existing)
 		if err != nil {
 			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: attach failed: %v", containerPid, mo.path, err)
 			continue
