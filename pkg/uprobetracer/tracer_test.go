@@ -41,7 +41,9 @@ type testState struct {
 
 	attachCount int        // number of real uprobe attaches performed
 	openFiles   []*os.File // every file handed out, so the test can clean up
-	lastOffset  *uint64    // pre-resolved file offset seen by the last attach
+	lastOffset  *uint64    // single pre-resolved offset seen by the last attach, nil if none
+	lastOffsets []uint64   // every offset seen by the last attach
+	lastLinks   int        // links returned by the last attach
 }
 
 func (s *testState) open(_ uint32, _ string) (*os.File, error) {
@@ -63,16 +65,28 @@ func (s *testState) readInode(_ int) (uint64, error) {
 	return s.currentInode, nil
 }
 
-func (s *testState) attach(_ *os.File, offset *uint64) (link.Link, error) {
+func (s *testState) attach(_ *os.File, offsets []uint64) ([]link.Link, error) {
 	if s.attachErr != nil {
 		return nil, s.attachErr
 	}
 	s.attachCount++
-	s.lastOffset = offset
-	// link.Link cannot be implemented outside cilium/ebpf (unexported method);
-	// keeper.close() tolerates a nil link, so the attach count is the observable
-	// signal for "how many uprobes were really attached".
-	return nil, nil
+	s.lastOffsets = offsets
+	// lastOffset keeps the single-offset assertions in the existing tests
+	// readable; it is only meaningful when exactly one offset was resolved.
+	s.lastOffset = nil
+	if len(offsets) == 1 {
+		s.lastOffset = &offsets[0]
+	}
+	// link.Link cannot be implemented outside cilium/ebpf (its isLink method is
+	// unexported), so the doubles are nil -- but there is one PER BOUND OFFSET,
+	// because the count is what the multi-link bookkeeping is measured by. A
+	// symbol-name attach binds one probe and so yields one.
+	n := len(offsets)
+	if n == 0 {
+		n = 1
+	}
+	s.lastLinks = n
+	return make([]link.Link, n), nil
 }
 
 // newTestTracer returns a tracer wired to the test seams, already in "running"
@@ -601,7 +615,7 @@ func TestReattachMappedLibrariesIdempotent(t *testing.T) {
 	// reattachMappedLibraries would after its first successful pass.
 	f, _ := os.Open(os.DevNull)
 	st.openFiles = append(st.openFiles, f)
-	tr.inodeRefCount[777] = &inodeKeeper{counter: 1, file: f, link: nil}
+	tr.inodeRefCount[777] = &inodeKeeper{counter: 1, file: f, links: nil}
 	tr.containerPid2Inodes[fakePid] = []uint64{777}
 
 	// Second pass: existing is seeded from containerPid2Inodes[fakePid] which
