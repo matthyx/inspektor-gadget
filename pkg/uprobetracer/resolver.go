@@ -102,6 +102,17 @@ func (t *Tracer[Event]) SetAttachOffsetsResolver(resolver AttachOffsetsResolver)
 	t.attachOffsetsResolver = resolver
 }
 
+// HasAttachOffsetResolver reports whether a resolver is registered.
+//
+// It exists so the operator that wires the two together can be tested for
+// having actually done so. Both halves of that wiring can be present and
+// correct while nothing connects them -- which is not a hypothetical: the
+// multi-offset resolver shipped with no call site, and every unit test on
+// either side still passed, because each side was fine in isolation.
+func (t *Tracer[Event]) HasAttachOffsetResolver() bool {
+	return t.attachOffsetsResolver != nil
+}
+
 // adaptSingleOffsetResolver lifts a single-offset resolver into the
 // multi-offset shape, so the tracer has exactly one internal code path and the
 // older form cannot rot.
