@@ -15,7 +15,12 @@
 package uprobetracer
 
 import (
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 )
 
 // These cover the seam between "this binary has no GNU build-id" and "the
@@ -155,6 +160,75 @@ func TestMultiOffsetResolverWithoutBuildID(t *testing.T) {
 	}
 	if got := tr.Stats().LinksAttached; got != uint64(len(offsets)) {
 		t.Errorf("LinksAttached = %d, want %d", got, len(offsets))
+	}
+}
+
+// capturingLogger records every line the tracer emits. It implements only
+// GenericLoggerWithLevelSetter; NewFromGenericLogger supplies the rest.
+type capturingLogger struct {
+	mu    sync.Mutex
+	lines []string
+	level logger.Level
+}
+
+func (c *capturingLogger) Log(_ logger.Level, params ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lines = append(c.lines, fmt.Sprint(params...))
+}
+
+func (c *capturingLogger) Logf(_ logger.Level, format string, params ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lines = append(c.lines, fmt.Sprintf(format, params...))
+}
+
+func (c *capturingLogger) SetLevel(l logger.Level) { c.level = l }
+func (c *capturingLogger) GetLevel() logger.Level  { return c.level }
+
+func (c *capturingLogger) linesContaining(substr string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, l := range c.lines {
+		if strings.Contains(l, substr) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// TestNoResolverDoesNoResolveWork pins the ORDER of the nil-resolver guard,
+// which an outcome assertion cannot.
+//
+// The guard returns before the ELF is parsed and the build-id note walked. Move
+// it below either and the outcome is unchanged -- still nil, still symbol-name
+// attach -- so every test that checks the result keeps passing while every
+// uprobe gadget with no resolver registered starts paying a full ELF parse and
+// note walk per candidate per container, on the same container-attach path the
+// attach-cost budget is measured against.
+//
+// Found in review: an earlier version of this file claimed to pin the ordering
+// and did not, because it asserted the outcome. This asserts the WORK instead:
+// every log line in resolveAttachOffsets shares the "offset resolve" prefix, so
+// the absence of any such line is evidence the function returned before doing
+// anything.
+func TestNoResolverDoesNoResolveWork(t *testing.T) {
+	cap := &capturingLogger{}
+	tr, st, _ := newResolverTracerWithBuildID(t, ProgUprobe, "SSL_write", nil)
+	tr.logger = logger.NewFromGenericLogger(cap)
+	st.currentInode = 704
+
+	// No resolver registered -- the shipped ssl shape.
+	if err := tr.AttachContainer(testContainer(fakePid)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	if st.attachCount != 1 {
+		t.Fatalf("attachCount = %d, want 1 (symbol-name attach)", st.attachCount)
+	}
+
+	if got := cap.linesContaining("offset resolve"); len(got) != 0 {
+		t.Errorf("resolveAttachOffsets did work with no resolver registered; it must return first.\nlines: %v", got)
 	}
 }
 
