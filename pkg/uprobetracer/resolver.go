@@ -49,11 +49,73 @@ const AttachOffsetResolverVar = "attachOffsetResolver"
 // block, because it runs on the uprobe attach path.
 type AttachOffsetResolver func(fd *os.File, containerPID uint32, buildID string, machine elf.Machine, symbol string) (offset uint64, err error)
 
-// SetAttachOffsetResolver registers the resolver consulted during the lock-free
-// open phase. It is called once, right after NewTracer and before any container
-// is attached, so it needs no lock.
+// AttachRequest describes one attach candidate to an AttachOffsetsResolver.
+//
+// It is a struct rather than a parameter list so that later additions do not
+// break embedders: this hook is implemented in a different module (the
+// node-agent), reached through an untyped GadgetContext variable, and a
+// signature change there fails by silently not matching the type assertion
+// rather than by failing to compile. A struct makes growth additive.
+type AttachRequest struct {
+	// File is the open candidate, also the source of BuildID and Machine. It
+	// must not be closed, and its read offset must not be consumed — use ReadAt.
+	File *os.File
+	// ContainerPID is carried for diagnostics only, never as an event-join key.
+	ContainerPID uint32
+	BuildID      string
+	Machine      elf.Machine
+	// Symbol is the tracer's attach symbol, from the "path:symbol" section name.
+	Symbol string
+	// ProgName distinguishes tracers that share a Symbol. This is load-bearing
+	// for Go's crypto/tls capture, where one symbol needs two different programs
+	// at different offsets — an entry probe reading the buffer argument, and
+	// probes at each RET reading the returned byte count, which Go's moving
+	// stacks make unsafe to reach with a uretprobe. Without ProgName a resolver
+	// receives identical requests for both and cannot tell them apart.
+	ProgName string
+}
+
+// AttachOffsetsResolver maps an attach candidate to the file offsets at which
+// its program should be attached. It is the multi-offset form of
+// AttachOffsetResolver: returning several offsets attaches the same program at
+// each of them.
+//
+// Returning an error, or an empty slice, means "no offsets for this target":
+// the caller falls back to today's unchanged symbol-name attach. A resolver
+// must never panic and must not block, because it runs on the uprobe attach
+// path.
+type AttachOffsetsResolver func(req AttachRequest) (offsets []uint64, err error)
+
+// SetAttachOffsetResolver registers the single-offset resolver consulted during
+// the lock-free open phase. It is called once, right after NewTracer and before
+// any container is attached, so it needs no lock.
+//
+// Retained unchanged so existing embedders keep working untouched; it adapts to
+// the multi-offset form internally.
 func (t *Tracer[Event]) SetAttachOffsetResolver(resolver AttachOffsetResolver) {
-	t.attachOffsetResolver = resolver
+	t.attachOffsetsResolver = adaptSingleOffsetResolver(resolver)
+}
+
+// SetAttachOffsetsResolver registers the multi-offset resolver. Same contract
+// and same call-once timing as SetAttachOffsetResolver.
+func (t *Tracer[Event]) SetAttachOffsetsResolver(resolver AttachOffsetsResolver) {
+	t.attachOffsetsResolver = resolver
+}
+
+// adaptSingleOffsetResolver lifts a single-offset resolver into the
+// multi-offset shape, so the tracer has exactly one internal code path and the
+// older form cannot rot.
+func adaptSingleOffsetResolver(resolver AttachOffsetResolver) AttachOffsetsResolver {
+	if resolver == nil {
+		return nil
+	}
+	return func(req AttachRequest) ([]uint64, error) {
+		offset, err := resolver(req.File, req.ContainerPID, req.BuildID, req.Machine, req.Symbol)
+		if err != nil {
+			return nil, err
+		}
+		return []uint64{offset}, nil
+	}
 }
 
 // resolveAttachOffset asks the registered resolver for a file offset for the
@@ -73,8 +135,8 @@ func (t *Tracer[Event]) SetAttachOffsetResolver(resolver AttachOffsetResolver) {
 // Reading t.attachSymbol off-lock is race-free: it is written once in AttachProg
 // under t.mu, and every caller of this function has already observed
 // t.prog != nil under t.mu, which orders that write before this read.
-func (t *Tracer[Event]) resolveAttachOffset(file *os.File, containerPid uint32) *uint64 {
-	resolver := t.attachOffsetResolver
+func (t *Tracer[Event]) resolveAttachOffsets(file *os.File, containerPid uint32) []uint64 {
+	resolver := t.attachOffsetsResolver
 	if resolver == nil {
 		return nil
 	}
@@ -92,13 +154,26 @@ func (t *Tracer[Event]) resolveAttachOffset(file *os.File, containerPid uint32) 
 		return nil
 	}
 
-	offset, err := resolver(file, containerPid, buildID, ef.Machine, t.attachSymbol)
+	offsets, err := resolver(AttachRequest{
+		File:         file,
+		ContainerPID: containerPid,
+		BuildID:      buildID,
+		Machine:      ef.Machine,
+		Symbol:       t.attachSymbol,
+		ProgName:     t.progName,
+	})
 	if err != nil {
+		t.resolverFailOpen.Add(1)
 		t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: %v", containerPid, buildID, t.attachSymbol, err)
 		return nil
 	}
-	t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: attaching at file offset %#x", containerPid, buildID, t.attachSymbol, offset)
-	return &offset
+	if len(offsets) == 0 {
+		t.resolverFailOpen.Add(1)
+		t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: no offsets returned", containerPid, buildID, t.attachSymbol)
+		return nil
+	}
+	t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: attaching at file offsets %#x", containerPid, buildID, t.attachSymbol, offsets)
+	return offsets
 }
 
 // uprobeOffsetOptions builds the link options that bind a uprobe at an
@@ -205,5 +280,32 @@ func AttachOffsetResolverFromVar(v any) (AttachOffsetResolver, error) {
 		return r, nil
 	default:
 		return nil, fmt.Errorf("%q is a %T, want uprobetracer.AttachOffsetResolver", AttachOffsetResolverVar, v)
+	}
+}
+
+// AttachOffsetsResolverFromVar type-checks a value read from a GadgetContext
+// variable set via SetVar(AttachOffsetResolverVar, ...) and normalises it to the
+// multi-offset form.
+//
+// FOUR shapes are accepted, and the two legacy ones are the reason this
+// function is written this way rather than as a single assertion. An embedder
+// registers through an untyped variable, so a shape this function does not
+// recognise is not a compile error and not a runtime error either — the value is
+// simply ignored and the tracer silently falls back to symbol-name attach. For
+// a stripped, statically linked target that fallback cannot bind, so the
+// embedder's feature stops working with no error anywhere. Dropping the legacy
+// shapes here would do exactly that to any embedder still registering them.
+func AttachOffsetsResolverFromVar(v any) (AttachOffsetsResolver, error) {
+	switch r := v.(type) {
+	case AttachOffsetsResolver:
+		return r, nil
+	case func(AttachRequest) ([]uint64, error):
+		return r, nil
+	case AttachOffsetResolver:
+		return adaptSingleOffsetResolver(r), nil
+	case func(*os.File, uint32, string, elf.Machine, string) (uint64, error):
+		return adaptSingleOffsetResolver(r), nil
+	default:
+		return nil, fmt.Errorf("%q is a %T, want uprobetracer.AttachOffsetsResolver or uprobetracer.AttachOffsetResolver", AttachOffsetResolverVar, v)
 	}
 }

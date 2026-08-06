@@ -266,7 +266,7 @@ func TestCommitPhaseDoesNoFileWorkWithPreResolvedOffset(t *testing.T) {
 	off := uint64(0x4000)
 	tr.mu.Lock()
 	tr.containerPid2Inodes[fakePid] = nil
-	tr.commitOpenedTargets(fakePid, []openedTarget{{file: f, label: "/lib/libtest.so", offset: &off}})
+	tr.commitOpenedTargets(fakePid, []openedTarget{{file: f, label: "/lib/libtest.so", offsets: []uint64{off}}})
 	tr.mu.Unlock()
 
 	if resolveCalls != 0 {
@@ -298,7 +298,7 @@ func TestMappedLibrariesCarryResolvedOffset(t *testing.T) {
 		file:     f,
 		path:     "/tmp/libnetty.so",
 		rangeKey: "7f0000000000-7f0000001000",
-		offset:   &wantOffset,
+		offsets:  []uint64{wantOffset},
 	}})
 	tr.mu.Unlock()
 
