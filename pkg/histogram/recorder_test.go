@@ -80,17 +80,23 @@ func TestRecorderNegativeDurationCounted(t *testing.T) {
 }
 
 func TestExp2Slot(t *testing.T) {
+	// These pin the alignment with NewIntervalsFromExp2Slots: slot i must cover
+	// [2^i, 2^(i+1)). The previous table encoded a slot convention one power of
+	// two too high, which is why it passed while every rendered quantile was 2x
+	// the truth.
 	tests := []struct {
 		micros uint64
 		want   int
 	}{
 		{0, 0},
-		{1, 1},
-		{2, 2},
-		{3, 2},
-		{4, 3},
-		{7, 3},
-		{8, 4},
+		{1, 0},
+		{2, 1},
+		{3, 1},
+		{4, 2},
+		{7, 2},
+		{8, 3},
+		{15, 3},
+		{16, 4},
 	}
 	for _, tc := range tests {
 		if got := exp2Slot(tc.micros); got != tc.want {
@@ -165,5 +171,48 @@ func TestObserveSince(t *testing.T) {
 	r.ObserveSince(time.Now())
 	if got := r.Stats().Count; got != 1 {
 		t.Errorf("Count = %d, want 1", got)
+	}
+}
+
+// TestHistogramBucketsContainMax is the cross-check this type shipped without,
+// and the reason a real misalignment survived its own unit tests.
+//
+// Max is recorded independently of the buckets. The buckets and Quantile both
+// read through NewIntervalsFromExp2Slots, so if exp2Slot disagrees with that
+// renderer's convention neither can reveal it -- they are wrong together and
+// consistent with each other. Only Max, which never passes through the
+// renderer, can contradict them. Requiring the rendered bucket that holds the
+// largest sample to actually contain Max pins the two conventions together.
+func TestHistogramBucketsContainMax(t *testing.T) {
+	for _, sample := range []time.Duration{
+		1 * time.Microsecond,
+		500 * time.Microsecond,
+		8941 * time.Microsecond,
+		37 * time.Millisecond,
+		1 * time.Second,
+	} {
+		t.Run(sample.String(), func(t *testing.T) {
+			var r Recorder
+			r.Observe(sample)
+			s := r.Stats()
+
+			if s.Histogram == nil || len(s.Histogram.Intervals) == 0 {
+				t.Fatal("no histogram produced for a recorded sample")
+			}
+			last := s.Histogram.Intervals[len(s.Histogram.Intervals)-1]
+			if last.Count != 1 {
+				t.Fatalf("the last populated bucket holds %d samples, want 1", last.Count)
+			}
+
+			maxMicros := uint64(s.Max.Microseconds())
+			if maxMicros < last.Start || maxMicros > last.End {
+				t.Errorf("Max is %d us but its bucket renders as [%d, %d] -- the slot convention disagrees with the renderer",
+					maxMicros, last.Start, last.End)
+			}
+			// A quantile must not exceed the containing bucket's upper edge.
+			if got := s.Quantile(1); got > time.Duration(last.End)*time.Microsecond {
+				t.Errorf("Quantile(1) = %v exceeds its bucket's upper edge %v", got, time.Duration(last.End)*time.Microsecond)
+			}
+		})
 	}
 }

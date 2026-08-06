@@ -76,14 +76,22 @@ func (r *Recorder) ObserveSince(start time.Time) {
 	r.Observe(time.Since(start))
 }
 
-// exp2Slot returns the bucket index for a microsecond value: 0 for zero, and
-// otherwise the position of the value's highest set bit plus one, so bucket i
-// covers [2^(i-1), 2^i).
+// exp2Slot returns the bucket index for a microsecond value, matching the
+// convention NewIntervalsFromExp2Slots renders: slot i covers [2^i, 2^(i+1)),
+// with slot 0 additionally absorbing zero.
+//
+// The alignment with that renderer is the whole contract. Using the highest set
+// bit directly (bits.Len64, without the -1) puts every sample one slot too
+// high, and because both the rendered histogram and Quantile read the slots
+// through the same renderer, the error is invisible from either on its own --
+// every reported quantile simply comes out 2x the truth. What exposes it is
+// Max, which is recorded independently: a max of 8.9ms alongside a populated
+// "[16384, 32768) us" bucket cannot both be right.
 func exp2Slot(micros uint64) int {
 	if micros == 0 {
 		return 0
 	}
-	slot := bits.Len64(micros)
+	slot := bits.Len64(micros) - 1
 	if slot >= exp2Slots {
 		return exp2Slots - 1
 	}
