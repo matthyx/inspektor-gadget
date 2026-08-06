@@ -159,10 +159,21 @@ func (t *Tracer[Event]) resolveAttachOffsets(file *os.File, containerPid uint32)
 	}
 	defer ef.Close()
 
+	// A missing build-id must NOT skip the resolver.
+	//
+	// The build-id is a CACHE KEY, not a precondition for resolution. A
+	// structural resolver (.gopclntab) needs no build-id at all; a table-driven
+	// one simply misses and declines. Returning nil here instead meant "attach
+	// by symbol name" -- which a gadget that has no symbol-name fallback cannot
+	// use -- so a binary with no .note.gnu.build-id produced zero attach, zero
+	// error, and the resolver's own gates and metrics never ran at all.
+	//
+	// It is a LINKER property, not a Go-version one: Go only began emitting the
+	// note by default in go1.24, and -ldflags=-buildid= (or a custom link, or a
+	// vendor toolchain) suppresses it on any version including the newest.
 	buildID, err := elfBuildID(ef)
 	if err != nil {
-		t.logger.Debugf("uprobetracer: offset resolve for container %d: reading build-id: %v", containerPid, err)
-		return nil
+		t.logger.Debugf("uprobetracer: offset resolve for container %d: no usable build-id (%v); consulting the resolver anyway", containerPid, err)
 	}
 
 	offsets, err := resolver(AttachRequest{
@@ -175,15 +186,15 @@ func (t *Tracer[Event]) resolveAttachOffsets(file *os.File, containerPid uint32)
 	})
 	if err != nil {
 		t.resolverFailOpen.Add(1)
-		t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: %v", containerPid, buildID, t.attachSymbol, err)
+		t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: %v", containerPid, logBuildID(buildID), t.attachSymbol, err)
 		return nil
 	}
 	if len(offsets) == 0 {
 		t.resolverFailOpen.Add(1)
-		t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: no offsets returned", containerPid, buildID, t.attachSymbol)
+		t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: no offsets returned", containerPid, logBuildID(buildID), t.attachSymbol)
 		return nil
 	}
-	t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: attaching at file offsets %#x", containerPid, buildID, t.attachSymbol, offsets)
+	t.logger.Debugf("uprobetracer: offset resolve for container %d, build-id %s, symbol %q: attaching at file offsets %#x", containerPid, logBuildID(buildID), t.attachSymbol, offsets)
 	return offsets
 }
 
@@ -203,6 +214,17 @@ func uprobeOffsetOptions(offset *uint64) *link.UprobeOptions {
 }
 
 var errNoBuildID = errors.New("no GNU build-id note")
+
+// logBuildID renders a build-id for a decision log line, naming the empty case
+// rather than printing nothing. The absence is precisely the condition worth
+// being able to see: it is how the silent-zero-capture bug was diagnosed, and
+// an empty %s in the middle of a log line reads as a formatting glitch.
+func logBuildID(buildID string) string {
+	if buildID == "" {
+		return "<none>"
+	}
+	return buildID
+}
 
 // maxNoteSize bounds how much of a note region is read, so a corrupt or hostile
 // header cannot make us allocate arbitrarily.
