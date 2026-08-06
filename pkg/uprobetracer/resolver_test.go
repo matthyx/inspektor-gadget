@@ -135,10 +135,19 @@ func TestUprobeOffsetOptions(t *testing.T) {
 // synthetic ELF, so the resolve path runs on a parseable binary.
 func newResolverTracer(t *testing.T, progType ProgType, symbol string) (*Tracer[any], *testState, *os.File) {
 	t.Helper()
+	return newResolverTracerWithBuildID(t, progType, symbol, testBuildID)
+}
+
+// newResolverTracerWithBuildID is newResolverTracer with the target's build-id
+// under the caller's control. Passing nil yields an ELF whose note carries a
+// zero-length descriptor, which is what a binary linked with -ldflags=-buildid=
+// looks like to elfBuildID: no usable build-id.
+func newResolverTracerWithBuildID(t *testing.T, progType ProgType, symbol string, buildID []byte) (*Tracer[any], *testState, *os.File) {
+	t.Helper()
 	tr, st := newTestTracer(t)
 	tr.progType = progType
 	tr.attachSymbol = symbol
-	elfFile := writeSyntheticELF(t, testBuildID)
+	elfFile := writeSyntheticELF(t, buildID)
 	tr.openInContainer = func(_ uint32, _ string) (*os.File, error) {
 		f, err := os.Open(elfFile.Name())
 		if err != nil {
