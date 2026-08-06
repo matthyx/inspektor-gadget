@@ -459,6 +459,12 @@ func (t *Tracer[Event]) attachUprobe(file *os.File, offsets []uint64) ([]link.Li
 
 	// USDT takes its attach address from the note section, so a resolver's
 	// offsets do not apply to it and it is always a single probe.
+	//
+	// KNOWN GAP (accepted, review-noted): this branch sits below the attachToFile
+	// test seam and so is not covered -- a mutant returning a nil slice here
+	// survives. Hoisting it the way bindSites was would need the USDT metadata
+	// read parameterised too, which is not worth it for a single-probe path no
+	// gadget in play uses. Revisit if a USDT gadget ships.
 	if t.progType == ProgUSDT {
 		attachInfo, err := getUsdtInfo(attachPath, t.attachSymbol)
 		if err != nil {
@@ -475,18 +481,35 @@ func (t *Tracer[Event]) attachUprobe(file *os.File, offsets []uint64) ([]link.Li
 		return []link.Link{l}, nil
 	}
 
-	// No offsets is today's unchanged path: one probe, bound by symbol name.
+	return t.bindSites(offsets, func(offset *uint64) (link.Link, error) {
+		return t.bindProbe(ex, offset)
+	})
+}
+
+// bindSites turns a resolved offset set into bound probes: one probe bound by
+// symbol name when there are no offsets, otherwise one per offset, all or none.
+//
+// The empty case is the path every gadget that does not use offset attach takes
+// -- ssl included -- so its single-element result is load-bearing rather than a
+// formality. Returning a nil slice there would still bind the probe in the
+// kernel, but nothing would hold the link, and the runtime finalizer would close
+// it moments later: the probe detaches on its own with no error anywhere. The
+// link counters would not catch it either, since an empty slice balances
+// against itself on teardown.
+//
+// It takes bind as a parameter for the same reason bindAll does: everything
+// below attachToFile is replaced wholesale by the test seam, so a branch that
+// is not hoisted above it cannot be tested without a kernel. (Found in review;
+// the empty-offsets branch previously sat below the seam and no test reached it.)
+func (t *Tracer[Event]) bindSites(offsets []uint64, bind func(offset *uint64) (link.Link, error)) ([]link.Link, error) {
 	if len(offsets) == 0 {
-		l, err := t.bindProbe(ex, nil)
+		l, err := bind(nil)
 		if err != nil {
 			return nil, err
 		}
 		return []link.Link{l}, nil
 	}
-
-	return t.bindAll(offsets, func(offset *uint64) (link.Link, error) {
-		return t.bindProbe(ex, offset)
-	})
+	return t.bindAll(offsets, bind)
 }
 
 // bindAll binds every offset or none.

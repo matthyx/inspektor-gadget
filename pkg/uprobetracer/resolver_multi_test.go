@@ -257,11 +257,12 @@ func TestMultiOffsetRefcountIsPerPidNotPerLink(t *testing.T) {
 	}
 }
 
-// A bind that fails partway must leave NOTHING bound: the already-bound probes
-// are closed again and the target is skipped, because a half-probed Read
-// capture emits started-but-never-completed reads that read as data rather
-// than as breakage.
-func TestPartialBindRollsBack(t *testing.T) {
+// A failed bind must leave no keeper, no reference, and no leaked descriptor.
+// This is the wholesale-failure case -- the test seam replaces the whole binder,
+// so the attach either succeeds or fails as a unit here; the genuinely partial
+// case lives in TestBindAllRollsBackOnPartialFailure, which reaches the loop
+// directly.
+func TestFailedBindTakesNoReference(t *testing.T) {
 	tr, st, _ := newResolverTracer(t, ProgUprobe, "crypto/tls.(*Conn).Read")
 	st.currentInode = 613
 	st.attachErr = errors.New("symbol absent")
@@ -336,6 +337,83 @@ func TestBindAllRollsBackOnPartialFailure(t *testing.T) {
 				t.Errorf("LinksAttached = %d after a rolled-back bind, want 0 -- nothing reached a keeper", stats.LinksAttached)
 			}
 		})
+	}
+}
+
+// TestBindSitesWithoutOffsetsBindsExactlyOneProbe covers the path every gadget
+// that does NOT use offset attach takes, ssl included.
+//
+// The single-element result is load-bearing, not a formality. Returning a nil
+// slice would still bind the probe in the kernel, but nothing would hold the
+// link and the runtime finalizer would close it moments later -- the probe
+// detaches by itself, silently, with no error anywhere. The link counters would
+// not notice either: an empty slice balances against itself on teardown, so
+// LinksAttached == LinksClosed stays true while nothing is actually attached.
+//
+// Found in review: this branch previously sat below the attachToFile seam,
+// which every test replaces wholesale, so nothing reached it.
+func TestBindSitesWithoutOffsetsBindsExactlyOneProbe(t *testing.T) {
+	tr, _ := newTestTracer(t)
+
+	calls := 0
+	var sawOffset *uint64
+	sawOffsetSet := false
+	links, err := tr.bindSites(nil, func(offset *uint64) (link.Link, error) {
+		calls++
+		sawOffset = offset
+		sawOffsetSet = true
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("bindSites: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("bind called %d times, want 1", calls)
+	}
+	if !sawOffsetSet || sawOffset != nil {
+		t.Errorf("bind received offset %v, want nil -- symbol-name attach passes no offset", sawOffset)
+	}
+	if len(links) != 1 {
+		t.Fatalf("bindSites returned %d links, want exactly 1 -- a nil slice would let the finalizer silently detach the probe", len(links))
+	}
+	if got := tr.Stats().AttachRollbacks; got != 0 {
+		t.Errorf("AttachRollbacks = %d, want 0", got)
+	}
+}
+
+// An empty offset set propagates a bind failure rather than reporting success
+// with nothing bound.
+func TestBindSitesWithoutOffsetsPropagatesFailure(t *testing.T) {
+	tr, _ := newTestTracer(t)
+	links, err := tr.bindSites(nil, func(_ *uint64) (link.Link, error) {
+		return nil, errors.New("symbol absent")
+	})
+	if err == nil {
+		t.Fatal("bindSites succeeded despite a failing bind")
+	}
+	if links != nil {
+		t.Errorf("bindSites returned %d links on failure, want none", len(links))
+	}
+}
+
+// With offsets, bindSites delegates to the all-or-nothing loop.
+func TestBindSitesWithOffsetsBindsEachOne(t *testing.T) {
+	tr, _ := newTestTracer(t)
+	offsets := []uint64{0x10, 0x20, 0x30}
+
+	calls := 0
+	links, err := tr.bindSites(offsets, func(offset *uint64) (link.Link, error) {
+		calls++
+		if offset == nil {
+			t.Error("bind received a nil offset while offsets were supplied")
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("bindSites: %v", err)
+	}
+	if calls != len(offsets) || len(links) != len(offsets) {
+		t.Errorf("bind called %d times returning %d links, want %d of each", calls, len(links), len(offsets))
 	}
 }
 
