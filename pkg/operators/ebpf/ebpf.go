@@ -343,6 +343,43 @@ func (i *ebpfInstance) analyze(gadgetCtx operators.GadgetContext, paramValues ap
 	return nil
 }
 
+// newUprobeTracer creates a uprobe tracer and wires any embedder-registered
+// attach-offset resolver from the gadget context onto it.
+//
+// An embedder registers a resolver to attach uprobes at a file offset instead
+// of by symbol name, for targets that export no symbol to bind (a stripped,
+// statically linked TLS library) or that need several attach points for one
+// symbol. Reading it from the GadgetContext scopes it to this gadget instance:
+// vars are per-context, so an unrelated gadget never picks it up.
+//
+// Both the single- and multi-offset registration shapes are accepted here,
+// because AttachOffsetsResolverFromVar accepts all of them -- the plural entry
+// point is a superset of the singular one, never a replacement for it.
+//
+// Split out of init purely so this wiring can be tested: init needs a loaded
+// gadget image to reach this point, which is why the resolver plumbing was
+// able to ship with no call site at all and no test noticing.
+func (i *ebpfInstance) newUprobeTracer(gadgetCtx operators.GadgetContext) (*uprobetracer.Tracer[api.GadgetData], error) {
+	uprobeTracer, err := uprobetracer.NewTracer[api.GadgetData](gadgetCtx.Logger())
+	if err != nil {
+		return nil, fmt.Errorf("creating uprobe tracer: %w", err)
+	}
+	v, ok := gadgetCtx.GetVar(uprobetracer.AttachOffsetResolverVar)
+	if !ok {
+		return uprobeTracer, nil
+	}
+	// A registered-but-unusable resolver fails the gadget rather than being
+	// ignored: the embedder asked for offset attach, and silently falling back
+	// to symbol-name attach would leave a target it cannot bind silently
+	// uninstrumented.
+	resolver, err := uprobetracer.AttachOffsetsResolverFromVar(v)
+	if err != nil {
+		return nil, fmt.Errorf("registering attach offset resolver: %w", err)
+	}
+	uprobeTracer.SetAttachOffsetsResolver(resolver)
+	return uprobeTracer, nil
+}
+
 func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 	// hack for backward-compability and until we have nicer interfaces available
 	gadgetCtx.SetVar("ebpfInstance", i)
@@ -393,22 +430,9 @@ func (i *ebpfInstance) init(gadgetCtx operators.GadgetContext) error {
 			if strings.HasPrefix(p.SectionName, "uprobe/") ||
 				strings.HasPrefix(p.SectionName, "uretprobe/") ||
 				strings.HasPrefix(p.SectionName, "usdt/") {
-				uprobeTracer, err := uprobetracer.NewTracer[api.GadgetData](gadgetCtx.Logger())
+				uprobeTracer, err := i.newUprobeTracer(gadgetCtx)
 				if err != nil {
-					return fmt.Errorf("creating uprobe tracer: %w", err)
-				}
-				// An embedder can register an AttachOffsetResolver on this
-				// gadget's context to attach uprobes at a file offset instead of
-				// by symbol name (stripped, statically-linked TLS libraries
-				// export no symbol to bind). Reading it from the GadgetContext
-				// scopes it to this gadget instance: vars are per-context, so an
-				// unrelated gadget never picks it up.
-				if v, ok := gadgetCtx.GetVar(uprobetracer.AttachOffsetResolverVar); ok {
-					resolver, err := uprobetracer.AttachOffsetResolverFromVar(v)
-					if err != nil {
-						return fmt.Errorf("registering attach offset resolver: %w", err)
-					}
-					uprobeTracer.SetAttachOffsetResolver(resolver)
+					return err
 				}
 				i.uprobeTracers[p.Name] = uprobeTracer
 			}
