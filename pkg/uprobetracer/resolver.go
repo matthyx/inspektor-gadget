@@ -62,8 +62,19 @@ type AttachRequest struct {
 	File *os.File
 	// ContainerPID is carried for diagnostics only, never as an event-join key.
 	ContainerPID uint32
-	BuildID      string
-	Machine      elf.Machine
+	// BuildID is the target's GNU build-id, or EMPTY when it carries none --
+	// measured at 45 of 97 real Go binaries, so the empty case is nearly half
+	// the population rather than an edge case. Go began emitting the note by
+	// default only in go1.24, and -ldflags=-buildid= suppresses it on any
+	// version, so this is a property of the build and cannot be predicted from
+	// the project or the toolchain version.
+	//
+	// It is a CACHE KEY, never a precondition for resolving. A resolver MUST
+	// NOT key a cache on it without handling the empty case, or every
+	// build-id-less binary aliases onto the first one's offsets -- a
+	// wrong-offset attach, at roughly half of all binaries.
+	BuildID string
+	Machine elf.Machine
 	// Symbol is the tracer's attach symbol, from the "path:symbol" section name.
 	Symbol string
 	// ProgName distinguishes tracers that share a Symbol. This is load-bearing
