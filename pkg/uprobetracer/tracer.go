@@ -230,7 +230,9 @@ type Tracer[Event any] struct {
 	// is awaited before runc's create→start is unblocked, so a slow attach there
 	// (e.g. ELF parse of a large statically-linked binary, or setns) wedges
 	// container starts under a pod burst. attachSem caps how many of those attaches
-	// run concurrently; attachWg lets Close join the in-flight ones.
+	// run concurrently; attachWg lets Close join the in-flight ones. It defaults to
+	// the process-wide globalAttachSem -- see maxConcurrentAttaches for why the
+	// budget cannot be per-tracer -- and SetAttachSemaphore replaces it.
 	attachSem chan struct{}
 	attachWg  sync.WaitGroup
 	// syncAttach makes AttachContainer run the attach INLINE instead of dispatching
@@ -242,10 +244,28 @@ type Tracer[Event any] struct {
 	mu     sync.Mutex
 }
 
-// maxConcurrentAttaches caps concurrent background create-time attaches so a
-// pod-burst cannot spawn an unbounded number of simultaneous setns/ELF-parse
-// operations (the resource spike seen in the original wedge incident).
-const maxConcurrentAttaches = 8
+// maxConcurrentAttaches caps concurrent background create-time attaches.
+//
+// The binding constraint is the MEMORY a slot holds, not its setns/syscall
+// cost. A slot that reaches a registered AttachOffsetsResolver parses the
+// target's full Go symbol table (gosym.NewTable over .gopclntab), which for the
+// 100-150 MB statically-linked binaries that are routine in real images costs
+// 60-115 MB of live heap for the duration of that one parse. Eight slots is a
+// ~1 GB transient working set; on a node whose every already-running container
+// reaches the settled-attach path at startup that is the OOM, not a spike.
+const maxConcurrentAttaches = 2
+
+// globalAttachSem is the default attach semaphore, shared PROCESS-WIDE by every
+// Tracer built by NewTracer.
+//
+// Per-tracer semaphores do not bound anything useful here: one gadget creates
+// one Tracer per uprobe program (four for gotls), each of which independently
+// resolves the SAME binaries for the SAME containers, so a per-tracer cap of N
+// is really a cap of N x programs x gadgets concurrent full-binary parses. The
+// memory the cap exists to bound is a property of the process, so the budget is
+// held by the process. SetAttachSemaphore overrides it for tests and for
+// embedders that want a separate budget.
+var globalAttachSem = make(chan struct{}, maxConcurrentAttaches)
 
 // attachJob is the immutable snapshot a background create-time attach needs,
 // captured under t.mu at dispatch so the worker reads no write-once tracer fields
@@ -271,12 +291,57 @@ func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
 		openInContainer:        secureopen.OpenInContainer,
 		readRealInode:          kfilefields.ReadRealInodeFromFd,
 		openMapFileFunc:        openMapFile,
-		attachSem:              make(chan struct{}, maxConcurrentAttaches),
+		attachSem:              globalAttachSem,
 		logger:                 logger,
 		closed:                 false,
 	}
 	t.attachToFile = t.attachUprobe
 	return t, nil
+}
+
+// SetAttachSemaphore replaces the process-wide attach budget this tracer draws
+// from with sem. Call it before any container is attached; a nil sem is ignored
+// so a caller cannot accidentally uncap the budget.
+//
+// Sharing one sem across a set of tracers makes that set share one budget; the
+// default already shares one across the whole process (see globalAttachSem), so
+// this exists for tests that need a deterministic cap of their own and for
+// embedders isolating one gadget's attaches from another's.
+func (t *Tracer[Event]) SetAttachSemaphore(sem chan struct{}) {
+	if sem == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.attachSem = sem
+}
+
+// dedupPaths drops repeated attach candidates, keeping the first occurrence of
+// each distinct cleaned path.
+//
+// The settled-attach path offers /proc/<pid>/exe first and the create-time
+// resolution second, and for a statically-linked container those are USUALLY
+// the same file: the OCI process.args[0] fallback names exactly the binary the
+// entrypoint went on to exec. They are not always the same (a re-exec'd
+// entrypoint genuinely differs), so this dedups rather than dropping one
+// unconditionally. Left in, the duplicate is opened twice and -- far more
+// expensively -- handed to the AttachOffsetsResolver twice, doubling the peak
+// heap of the one operation the attach budget exists to bound.
+func dedupPaths(paths []string) []string {
+	if len(paths) < 2 {
+		return paths
+	}
+	seen := make(map[string]bool, len(paths))
+	out := paths[:0:0]
+	for _, p := range paths {
+		key := filepath.Clean(p)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, p)
+	}
+	return out
 }
 
 // AttachProg loads the ebpf program, and try attaching if there are pending containers
@@ -340,6 +405,7 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 	// AttachContainer's own runInline branch, which unlocks before calling
 	// attachContainerWork inline for the identical reason.
 	var syncJobs []attachJob
+	sem := t.attachSem
 	for pid := range t.pendingContainerPids {
 		if !t.containerPidSettled[pid] {
 			t.attach(pid)
@@ -364,8 +430,8 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 		t.attachWg.Add(1)
 		go func() {
 			defer t.attachWg.Done()
-			t.attachSem <- struct{}{}
-			defer func() { <-t.attachSem }()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			t.attachContainerWork(job)
 		}()
 	}
@@ -974,7 +1040,7 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 	if err != nil {
 		t.logger.Debugf("re-attaching to container %d: %s", containerPid, err.Error())
 	}
-	unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, libPaths...)
+	unsecuredAttachFilePaths = dedupPaths(append(unsecuredAttachFilePaths, libPaths...))
 
 	opened, openFailed := t.openTargets(containerPid, unsecuredAttachFilePaths)
 
@@ -1258,6 +1324,9 @@ func (t *Tracer[Event]) AttachContainer(container *containercollection.Container
 	t.containerPid2Inodes[pid] = nil
 	job := attachJob{pid: pid, attachFilePath: t.attachFilePath, attachSymbol: t.attachSymbol, progName: t.progName, ociConfig: container.OciConfig, settled: settled}
 	runInline := t.syncAttach
+	// Snapshot the semaphore under the lock so the worker never reads the field
+	// concurrently with SetAttachSemaphore.
+	sem := t.attachSem
 	if !runInline {
 		// Add UNDER the lock so it orders with Close (which sets closed under the
 		// lock before joining attachWg): Close can never miss this attach.
@@ -1274,8 +1343,8 @@ func (t *Tracer[Event]) AttachContainer(container *containercollection.Container
 		// on the container-start path. They bail fast on Close.
 		go func() {
 			defer t.attachWg.Done()
-			t.attachSem <- struct{}{}
-			defer func() { <-t.attachSem }()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			t.attachContainerWork(job)
 		}()
 	}
@@ -1316,7 +1385,7 @@ func (t *Tracer[Event]) attachContainerWork(job attachJob) {
 	if err != nil {
 		t.logger.Debugf("attaching to container %d: %s", job.pid, err.Error())
 	}
-	paths = append(paths, libPaths...)
+	paths = dedupPaths(append(paths, libPaths...))
 	if len(paths) == 0 {
 		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: no attach target for symbol %q", job.progName, job.pid, job.attachSymbol)
 		return
