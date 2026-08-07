@@ -760,10 +760,39 @@ func isEnrichedWithOCIConfigInfo(container *Container) bool {
 // WithOCIConfigEnrichment enriches container using provided OCI config.
 // Since this enricher is performant compared to the runtime client, it
 // should be used as a first step in the enrichment pipeline.
+//
+// A container commonly reaches this enricher with OciConfig already empty:
+// WithContainerRuntimeEnrichment's CRI-based discovery never sets it, and
+// that source consistently reports a container before WithContainerFanotifyEbpf's
+// slower fanotify path (intercept exec -> wait for the pidfile -> read
+// config.json) does. Rather than leave the container permanently without one
+// -- the state this enricher's own name promises to prevent -- derive it the
+// same way WithOCIConfigForInitialContainer does for pre-existing containers,
+// so a container discovered by ANY source ends up enriched the same way.
 func WithOCIConfigEnrichment() ContainerCollectionOption {
 	return func(cc *ContainerCollection) error {
 		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
-			if container.OciConfig == "" || isEnrichedWithOCIConfigInfo(container) {
+			// hookSupplied distinguishes an OciConfig this container already
+			// carried into the enricher (from WithContainerFanotifyEbpf, which
+			// captures config.json at container-create time and therefore knows
+			// definitively whether this is a pod sandbox) from one derived
+			// below on a best-effort basis from whatever source added this
+			// container. Only the former licenses the sandbox drop a few lines
+			// down -- see the comment there.
+			hookSupplied := container.OciConfig != ""
+			if container.OciConfig == "" {
+				cfg, err := deriveOciConfig(container)
+				if err != nil {
+					// Best-effort: not every discovery source's container is
+					// derivable this way (e.g. ContainerPid() not yet resolved),
+					// and that is not a reason to drop the container -- it just
+					// stays unenriched, same as before this fallback existed.
+					log.Debugf("OCIConfig enricher: could not derive OCI config for container %s: %s", container.Runtime.ContainerID, err)
+					return true
+				}
+				container.OciConfig = cfg
+			}
+			if isEnrichedWithOCIConfigInfo(container) {
 				return true
 			}
 
@@ -786,7 +815,16 @@ func WithOCIConfigEnrichment() ContainerCollectionOption {
 
 			// TODO: handle this once we support pod sandboxes via WithContainerRuntimeEnrichment
 			// Issue: https://github.com/inspektor-gadget/inspektor-gadget/issues/1095
-			if ct := resolver.ContainerType(annotations); ct == "sandbox" {
+			//
+			// Gated on hookSupplied: dropping is only correct when the OciConfig
+			// came from WithContainerFanotifyEbpf's own create-time capture,
+			// which is what this TODO was written against. A container reaching
+			// this point with a DERIVED config (the branch above) may have
+			// arrived via a discovery source -- WithContainerRuntimeEnrichment,
+			// today -- whose other consumers already expect to see it; making it
+			// vanish here would be an unrelated behaviour change riding along on
+			// the OCI-config backfill, not something this fix is meant to do.
+			if ct := resolver.ContainerType(annotations); ct == "sandbox" && hookSupplied {
 				return false
 			}
 
@@ -822,28 +860,7 @@ func WithOCIConfigEnrichment() ContainerCollectionOption {
 func WithOCIConfigForInitialContainer() ContainerCollectionOption {
 	return func(cc *ContainerCollection) error {
 		for _, container := range cc.initialContainers {
-			info, err := processhelpers.GetProcessInfo(int(container.ContainerPid()), 0, &procOpts{})
-			if err != nil {
-				log.Errorf("OCIConfig enricher: failed to get process info for container %s: %s", container.Runtime.ContainerID, err)
-				continue
-			}
-			bPath, err := os.Readlink(filepath.Join(host.HostProcFs, fmt.Sprintf("%d", info.PPID), "cwd"))
-			if err != nil {
-				log.Errorf("OCIConfig enricher: failed to read cwd symlink of container runtime for container %s: %s", container.Runtime.ContainerID, err)
-				continue
-			}
-
-			// In case of containerd, we get the bundle path of sandbox containers so we need to switch to the actual container directory.
-			if container.Runtime.RuntimeName == types.RuntimeNameContainerd && !strings.HasSuffix(bPath, container.Runtime.ContainerID) {
-				bPath = filepath.Join(filepath.Dir(bPath), filepath.Base(container.Runtime.ContainerID))
-			}
-
-			cfgPath, err := securejoin.SecureJoin(host.HostRoot, filepath.Join(bPath, "config.json"))
-			if err != nil {
-				log.Errorf("OCIConfig enricher: failed to join config.json path for container %s: %s", container.Runtime.ContainerID, err)
-				continue
-			}
-			cfg, err := readOciConfigFromPath(cfgPath)
+			cfg, err := deriveOciConfig(container)
 			if err != nil {
 				log.Errorf("OCIConfig enricher: failed to get OCI config for container %s: %s", container.Runtime.ContainerID, err)
 				continue
@@ -852,6 +869,39 @@ func WithOCIConfigForInitialContainer() ContainerCollectionOption {
 		}
 		return nil
 	}
+}
+
+// deriveOciConfig reconstructs a container's config.json from its runtime's
+// own process state, for a container whose discovery source (unlike
+// WithContainerFanotifyEbpf, which captures it directly at container-create
+// time) never carried an OCI config to begin with. Locates the runtime's
+// bundle directory via the container's parent process's cwd (the OCI runtime
+// contract keeps the runtime's cwd at the bundle root while the container
+// runs), adjusting for containerd's sandbox-container bundle-path quirk, then
+// reads config.json from it. Shared by WithOCIConfigForInitialContainer (the
+// startup backfill for pre-existing containers) and WithOCIConfigEnrichment's
+// enricher (the same backfill applied per-container, for any discovery source
+// that reaches AddContainer without one).
+func deriveOciConfig(container *Container) (string, error) {
+	info, err := processhelpers.GetProcessInfo(int(container.ContainerPid()), 0, &procOpts{})
+	if err != nil {
+		return "", fmt.Errorf("getting process info: %w", err)
+	}
+	bPath, err := os.Readlink(filepath.Join(host.HostProcFs, fmt.Sprintf("%d", info.PPID), "cwd"))
+	if err != nil {
+		return "", fmt.Errorf("reading cwd symlink of container runtime: %w", err)
+	}
+
+	// In case of containerd, we get the bundle path of sandbox containers so we need to switch to the actual container directory.
+	if container.Runtime.RuntimeName == types.RuntimeNameContainerd && !strings.HasSuffix(bPath, container.Runtime.ContainerID) {
+		bPath = filepath.Join(filepath.Dir(bPath), filepath.Base(container.Runtime.ContainerID))
+	}
+
+	cfgPath, err := securejoin.SecureJoin(host.HostRoot, filepath.Join(bPath, "config.json"))
+	if err != nil {
+		return "", fmt.Errorf("joining config.json path: %w", err)
+	}
+	return readOciConfigFromPath(cfgPath)
 }
 
 func readOciConfigFromPath(cfgPath string) (string, error) {

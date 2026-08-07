@@ -238,3 +238,52 @@ func TestWithTracerCollection(t *testing.T) {
 	cc.EnrichByNetNs(&ev, containers[0].Netns)
 	require.Equal(t, expected, ev, "events should be equal")
 }
+
+// withInitialContainer is a test-only option that seeds initialContainers
+// directly, the same slot WithContainerRuntimeEnrichment/WithPodInformer
+// populate in production -- without needing a real container runtime.
+func withInitialContainer(c *Container) ContainerCollectionOption {
+	return func(cc *ContainerCollection) error {
+		cc.initialContainers = append(cc.initialContainers, c)
+		return nil
+	}
+}
+
+// TestSettledAtDiscovery pins the safety-critical asymmetry the field exists
+// for: a container seeded as "initial" (i.e. already running before this
+// process started watching, so its pid is the settled entrypoint, not a
+// runtime shim) must report SettledAtDiscovery() == true once stored, and a
+// container added directly via AddContainer -- the fanotify discovery
+// shape, whose pid is still the shim at add-time -- must report false. A
+// regression here means an offset-resolving uprobe gadget could attach to
+// the container runtime itself instead of the container's own binary.
+func TestSettledAtDiscovery(t *testing.T) {
+	t.Parallel()
+
+	initial := &Container{
+		Runtime: RuntimeMetadata{
+			BasicRuntimeMetadata: types.BasicRuntimeMetadata{
+				ContainerID: "initial-container",
+			},
+		},
+	}
+	cc := ContainerCollection{}
+	err := cc.Initialize(withInitialContainer(initial))
+	require.NoError(t, err, "Failed to initialize container collection")
+
+	stored := cc.GetContainer("initial-container")
+	require.NotNil(t, stored, "initial container should be stored")
+	require.True(t, stored.SettledAtDiscovery(),
+		"a container seeded before Initialize must be marked settled at discovery")
+
+	fresh := &Container{
+		Runtime: RuntimeMetadata{
+			BasicRuntimeMetadata: types.BasicRuntimeMetadata{
+				ContainerID: "fresh-container",
+			},
+		},
+	}
+	cc.AddContainer(fresh)
+	require.False(t, fresh.SettledAtDiscovery(),
+		"a container added directly (the fanotify discovery shape) must NOT be marked settled -- its pid may still be the runtime shim")
+}

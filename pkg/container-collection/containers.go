@@ -78,6 +78,39 @@ type Container struct {
 
 	// when the container was removed. Useful for running cached containers.
 	deletionTimestamp time.Time
+
+	// settledAtDiscovery is true when this container was discovered AFTER its
+	// entrypoint had already execve'd, so ContainerPid() names the container's
+	// own executable rather than the runtime shim. False (including the zero
+	// value) means the container was discovered pre-exec, via the fanotify
+	// hook intercepting `runc create` -- at that point the pid is still runc
+	// itself, which is a Go binary with crypto/tls linked in, so treating it as
+	// settled would let an offset-resolving uprobe gadget attach to runc host-
+	// wide. That asymmetry makes this field safety-critical: it must only ever
+	// be set true by the initialContainers drain in Initialize (the sole
+	// discovery path that observes containers strictly post-exec), never by
+	// the fanotify handler. Not serialized: it describes how we found the
+	// container, not a property of the container itself.
+	settledAtDiscovery bool
+}
+
+// SettledAtDiscovery reports whether this container's pid was already the
+// settled entrypoint executable (not the runtime shim) at the moment it was
+// discovered. See the settledAtDiscovery field doc for why this matters and
+// which discovery paths may set it.
+func (c *Container) SettledAtDiscovery() bool {
+	return c.settledAtDiscovery
+}
+
+// NewSettledContainerForTest returns a Container whose SettledAtDiscovery()
+// reports true. It exists so unit tests in OTHER packages (e.g.
+// pkg/uprobetracer) can construct a settled Container directly, without
+// standing up a real ContainerCollection just to exercise Initialize's
+// initialContainers drain. Not for production use: settledAtDiscovery's
+// safety-critical invariant (see its doc comment) depends on Initialize being
+// the only PRODUCTION path that sets it true.
+func NewSettledContainerForTest() *Container {
+	return &Container{settledAtDiscovery: true}
 }
 
 // close releases any resources (like  file descriptors) the container is using.
