@@ -304,9 +304,9 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
 	if t.closed {
+		t.mu.Unlock()
 		return errors.New("uprobetracer has been closed")
 	}
 
@@ -316,11 +316,66 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 	t.attachSymbol = parts[1]
 	t.prog = prog
 
-	// attach to pending containers, then release the pending list
+	// Attach to pending containers, then release the pending list.
+	//
+	// Settled containers (see Container.SettledAtDiscovery) are dispatched
+	// through the SAME bounded async job mechanism as a normal create-time
+	// attach (attachContainerWork, gated by attachSem) rather than run
+	// synchronously in this loop, which is still holding t.mu at this point.
+	// A settled attach does real work an unsettled one never did here -- an
+	// ELF parse and, for a resolver-backed gadget, a full offset resolution
+	// -- and on a long-running node EVERY already-running container reaches
+	// this loop as settled. Left synchronous and unbounded, that is an
+	// uncapped-concurrency burst sized to the node's ENTIRE container count
+	// at once: confirmed on a real cluster to OOM node-agent on smaller
+	// instance types within the first minute of startup. Unsettled
+	// containers keep the original synchronous path (attach/attachOneFile,
+	// deliberately NOT resolver-backed) unchanged; see attachOneFile's own
+	// doc comment for why.
+	//
+	// syncJobs defers the syncAttach (test-only) inline calls until AFTER
+	// t.mu is released below -- attachContainerWork takes t.mu itself for its
+	// commit phase, and that lock is not reentrant, so calling it inline
+	// while still holding the lock here deadlocks. This mirrors
+	// AttachContainer's own runInline branch, which unlocks before calling
+	// attachContainerWork inline for the identical reason.
+	var syncJobs []attachJob
 	for pid := range t.pendingContainerPids {
-		t.attach(pid)
+		if !t.containerPidSettled[pid] {
+			t.attach(pid)
+			continue
+		}
+		job := attachJob{
+			pid:            pid,
+			attachFilePath: t.attachFilePath,
+			attachSymbol:   t.attachSymbol,
+			progName:       t.progName,
+			ociConfig:      t.containerPid2OciConfig[pid],
+			settled:        true,
+		}
+		// Reserve as tracked before dispatch, mirroring AttachContainer: a
+		// concurrent Reattach/Detach must see this pid immediately, not only
+		// once its (possibly still-queued) job runs.
+		t.containerPid2Inodes[pid] = nil
+		if t.syncAttach {
+			syncJobs = append(syncJobs, job)
+			continue
+		}
+		t.attachWg.Add(1)
+		go func() {
+			defer t.attachWg.Done()
+			t.attachSem <- struct{}{}
+			defer func() { <-t.attachSem }()
+			t.attachContainerWork(job)
+		}()
 	}
 	t.pendingContainerPids = nil
+
+	t.mu.Unlock()
+
+	for _, job := range syncJobs {
+		t.attachContainerWork(job)
+	}
 
 	return nil
 }
@@ -785,12 +840,18 @@ func (t *Tracer[Event]) commitOpenedTargets(containerPid uint32, opened []opened
 	return attachFailed
 }
 
-// try attaching to a container, will update `containerPid2Inodes`
+// try attaching to a container, will update `containerPid2Inodes`.
+//
+// Callers must not reach this for a settled container (see
+// Container.SettledAtDiscovery) — AttachProg's pending-drain loop routes
+// those through the bounded async job dispatch (attachContainerWork) instead,
+// specifically so a settled attach's extra work (a real ELF parse and, for a
+// resolver-backed gadget, full offset resolution) never runs synchronously
+// for every already-running container on the node at once. See AttachProg's
+// doc comment on that loop for why: run here unbounded, that burst OOM'd
+// node-agent on smaller instance types within a minute of startup on a real
+// cluster.
 func (t *Tracer[Event]) attach(containerPid uint32) {
-	if t.containerPidSettled[containerPid] {
-		t.attachSettled(containerPid)
-		return
-	}
 	unsecuredAttachFilePaths, err := t.searchForLibrary(containerPid)
 	if err != nil {
 		t.logger.Debugf("attaching to container %d: %s", containerPid, err.Error())
@@ -835,48 +896,6 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 		t.logger.Infof("uprobetracer: attached %q to container pid %d at %v", t.progName, containerPid, unsecuredAttachFilePaths)
 	} else {
 		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: resolved %v but bound 0 (symbol absent, or open/link failed: %v)", t.progName, containerPid, unsecuredAttachFilePaths, lastErr)
-	}
-}
-
-// attachSettled is attach's counterpart for a container discovered post-exec
-// (containerPidSettled[containerPid] true — see Container.SettledAtDiscovery).
-// It tries /proc/<pid>/exe first, ahead of the create-time OCI/ld-cache
-// resolution, and routes through openTargets/commitOpenedTargets so a
-// registered offset resolver is actually consulted — attach's own
-// attachOneFile loop deliberately is not (see attachOneFile's doc comment),
-// which is exactly the gap that leaves a probe-ID-only gadget (no symbol name
-// to fall back to) attaching nothing for every container this tracer learns
-// about before AttachProg's program has finished loading.
-//
-// Caller holds t.mu throughout, same as attach(): this is the pending-drain
-// path invoked once from AttachProg, not the per-container-start hot path
-// (that's attachContainerWork, which already unlocks around its own I/O), so
-// matching attach()'s existing lock discipline here is not a new cost.
-func (t *Tracer[Event]) attachSettled(containerPid uint32) {
-	var unsecuredAttachFilePaths []string
-	if exe, ok := t.settledExecutablePath(containerPid); ok {
-		unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, exe)
-	}
-	libPaths, err := t.resolveLibraryPaths(containerPid, t.attachFilePath, t.containerPid2OciConfig[containerPid])
-	if err != nil {
-		t.logger.Debugf("attaching to container %d: %s", containerPid, err.Error())
-	}
-	unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, libPaths...)
-
-	if len(unsecuredAttachFilePaths) == 0 {
-		t.logger.Debugf("cannot find file to attach in container %d for symbol %q", containerPid, t.attachSymbol)
-		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: no attach target for symbol %q (searchForLibrary err: %v)", t.progName, containerPid, t.attachSymbol, err)
-		t.containerPid2Inodes[containerPid] = nil
-		return
-	}
-
-	opened, _ := t.openTargets(containerPid, unsecuredAttachFilePaths)
-	t.commitOpenedTargets(containerPid, opened)
-
-	if inodes := t.containerPid2Inodes[containerPid]; len(inodes) > 0 {
-		t.logger.Infof("uprobetracer: attached %q to container pid %d at %v", t.progName, containerPid, unsecuredAttachFilePaths)
-	} else {
-		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: resolved %v but bound 0 (symbol absent, or open/link failed)", t.progName, containerPid, unsecuredAttachFilePaths)
 	}
 }
 
