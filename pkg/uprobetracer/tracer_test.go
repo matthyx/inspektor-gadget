@@ -309,6 +309,37 @@ func TestSettledExecutablePath(t *testing.T) {
 	}
 }
 
+// TestResolveLibraryPathsFallsBackWhenLdCacheAbsent pins the fix for a real
+// deployment failure: a statically-linked target (any scratch/distroless Go or
+// Rust binary, which is common for both the SSL gadget's BoringSSL-embedding
+// targets and every gotls target) has no /etc/ld.so.cache at all, since it has
+// no glibc. parseLdCache's underlying OpenInContainer then fails with
+// os.ErrNotExist -- previously indistinguishable from a real parse/I-O
+// failure, so resolveLibraryPaths returned that error immediately and never
+// reached the OCI-config executable fallback a few lines below, which exists
+// specifically to handle this case. Every uprobe on a real target hit this: it
+// silently found nothing to attach to, with the failure logged only as "no
+// attach target for symbol" a level up, giving no hint that ld cache absence
+// was the actual cause.
+//
+// fakePid's /proc/<fakePid>/root does not exist at all, which fails the SAME
+// way (os.ErrNotExist through the identical wrapped chain) as a real
+// container's root existing but its /etc/ld.so.cache not.
+func TestResolveLibraryPathsFallsBackWhenLdCacheAbsent(t *testing.T) {
+	tr, _ := newTestTracer(t)
+
+	const wantExe = "/usr/local/bin/myapp"
+	ociConfig := `{"process":{"args":["` + wantExe + `"]}}`
+
+	paths, err := tr.resolveLibraryPaths(fakePid, "libssl.so.3", ociConfig)
+	if err != nil {
+		t.Fatalf("resolveLibraryPaths: %v, want no error (ld cache absence must fall through to the OCI-config exe)", err)
+	}
+	if len(paths) != 1 || paths[0] != wantExe {
+		t.Errorf("resolveLibraryPaths = %v, want [%q] via the OCI-config fallback", paths, wantExe)
+	}
+}
+
 func TestReattachAfterCloseErrors(t *testing.T) {
 	tr, _ := newTestTracer(t)
 	tr.Close()

@@ -332,19 +332,32 @@ func (t *Tracer[Event]) resolveLibraryPaths(containerPid uint32, attachFilePath,
 
 	ldCachePath := "/etc/ld.so.cache"
 	ldCachePaths, err := parseLdCache(containerPid, ldCachePath, attachFilePath)
-	if err != nil {
+	// A missing ld.so.cache is not a parse failure to report, it is the expected
+	// state of any container with no glibc at all -- which is precisely the
+	// "statically-linked runtime" case the OCI-config fallback below exists to
+	// handle. Before this guard, that fallback was unreachable in the exact case
+	// it was built for: a scratch/distroless Go binary has no /etc/ld.so.cache,
+	// parseLdCache's os.ErrNotExist was treated the same as a real parse/I-O
+	// failure, and the function returned early with every uprobe gadget on that
+	// container (SSL and gotls alike) finding nothing to attach to and no error
+	// surfaced anywhere above this call. Any OTHER error here (malformed cache,
+	// permission denial, an I/O failure mid-read) still aborts: those describe a
+	// real problem worth surfacing, not an absent file.
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("parsing ld cache: %w", err)
 	}
 	if len(ldCachePaths) > 0 {
 		return ldCachePaths, nil
 	}
 
-	// The requested library is not a shared object in this container's ld cache.
-	// This is the common case for statically-linked runtimes that embed the
-	// library into their main executable (Node.js, and Go/Rust binaries that
-	// statically link OpenSSL/BoringSSL), where a `libssl`-targeted uprobe gadget
-	// would otherwise find nothing to attach to. Fall back to the container's
-	// intended executable: the symbol may be defined there.
+	// The requested library is not a shared object in this container's ld cache
+	// (or the container has no ld cache at all -- see above). This is the common
+	// case for statically-linked runtimes that embed the library into their main
+	// executable (Node.js, and Go/Rust binaries that statically link
+	// OpenSSL/BoringSSL, or Go's own crypto/tls), where a `libssl`- or
+	// probe-ID-targeted uprobe gadget would otherwise find nothing to attach to.
+	// Fall back to the container's intended executable: the symbol may be defined
+	// there.
 	//
 	// The executable is resolved from the OCI runtime config (process.args[0]),
 	// NOT from /proc/<pid>/exe: at container-create time (when AttachContainer
