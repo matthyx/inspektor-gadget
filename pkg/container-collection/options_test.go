@@ -274,3 +274,46 @@ func TestGetExpectedOwnerReference(t *testing.T) {
 		}
 	}
 }
+
+// ociConfigEnricher builds a ContainerCollection with only WithOCIConfigEnrichment
+// installed and returns its single enricher function directly, so tests can
+// exercise the enricher's decision logic without going through AddContainer's
+// dedup/publish machinery.
+func ociConfigEnricher(t *testing.T) func(*Container) bool {
+	t.Helper()
+	cc := &ContainerCollection{}
+	require.NoError(t, WithOCIConfigEnrichment()(cc))
+	require.Len(t, cc.containerEnrichers, 1)
+	return cc.containerEnrichers[0]
+}
+
+const containerdSandboxOciConfig = `{"annotations":{"io.kubernetes.cri.container-type":"sandbox"}}`
+
+// TestOCIConfigEnrichmentDropsHookSuppliedSandbox is a regression guard for
+// the pre-existing pod-sandbox drop: a container whose OciConfig was already
+// populated when it reached this enricher (the WithContainerFanotifyEbpf
+// shape, which captures config.json directly at container-create time and so
+// can assert "this really is a sandbox" with certainty) must still be
+// dropped. The R3 change (deriving OciConfig for containers that arrive
+// without one) must not weaken this case.
+func TestOCIConfigEnrichmentDropsHookSuppliedSandbox(t *testing.T) {
+	enrich := ociConfigEnricher(t)
+	container := &Container{OciConfig: containerdSandboxOciConfig}
+
+	require.False(t, enrich(container), "a hook-supplied sandbox config must still be dropped")
+}
+
+// TestOCIConfigEnrichmentDoesNotDropOnFailedDerivation is the counterpart:
+// a container that reaches this enricher WITHOUT an OciConfig (e.g. from
+// WithContainerRuntimeEnrichment's CRI-based discovery, which never sets
+// one) and whose derivation fails (no real process/bundle to introspect, the
+// ordinary case in a unit test) must be kept, not dropped -- derivation
+// failure is "stays unenriched", never "vanishes from the collection".
+func TestOCIConfigEnrichmentDoesNotDropOnFailedDerivation(t *testing.T) {
+	enrich := ociConfigEnricher(t)
+	container := &Container{}
+	container.Runtime.ContainerPID = 0 // unresolvable: deriveOciConfig must fail closed, not panic
+
+	require.True(t, enrich(container), "derivation failure must not drop the container")
+	require.Empty(t, container.OciConfig, "a failed derivation must leave OciConfig empty, not partially populated")
+}

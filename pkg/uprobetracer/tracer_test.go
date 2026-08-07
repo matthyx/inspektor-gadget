@@ -44,9 +44,11 @@ type testState struct {
 	lastOffset  *uint64    // single pre-resolved offset seen by the last attach, nil if none
 	lastOffsets []uint64   // every offset seen by the last attach
 	lastLinks   int        // links returned by the last attach
+	openedPaths []string   // every path passed to openInContainer, in call order
 }
 
-func (s *testState) open(_ uint32, _ string) (*os.File, error) {
+func (s *testState) open(_ uint32, filePath string) (*os.File, error) {
+	s.openedPaths = append(s.openedPaths, filePath)
 	if s.openErr != nil {
 		return nil, s.openErr
 	}
@@ -128,6 +130,15 @@ func testContainer(pid uint32) *containercollection.Container {
 }
 
 const fakePid = uint32(4000000) // outside any real /proc range
+
+// settledTestContainer builds a Container whose SettledAtDiscovery() reports
+// true (via containercollection.NewSettledContainerForTest), mirroring
+// testContainer for the settled case.
+func settledTestContainer(pid uint32) *containercollection.Container {
+	c := containercollection.NewSettledContainerForTest()
+	c.Runtime.ContainerPID = pid
+	return c
+}
 
 func TestReattachIdempotentSameInode(t *testing.T) {
 	tr, st := newTestTracer(t)
@@ -796,5 +807,153 @@ func TestReattachMappedLibrariesSymbolAbsent(t *testing.T) {
 	}
 	if len(tr.inodeRefCount) != 0 {
 		t.Errorf("inodeRefCount mutated on symbol-absent skip: %v", tr.inodeRefCount)
+	}
+}
+
+// selfExeTarget resolves the real settled-exe target for the test binary
+// itself, the same way settledExecutablePath does, so tests can assert on the
+// exact path rather than only its presence.
+func selfExeTarget(t *testing.T) string {
+	t.Helper()
+	target, err := os.Readlink("/proc/self/exe")
+	if err != nil {
+		t.Skipf("cannot read /proc/self/exe on this system: %v", err)
+	}
+	return target
+}
+
+// TestAttachContainerSettledTriesProcExeFirst pins the load-bearing half of
+// the settled-strategy switch: a container discovered post-exec
+// (SettledAtDiscovery() true) must have /proc/<pid>/exe tried FIRST, ahead of
+// the create-time OCI/ld-cache resolution -- exactly what ReattachContainerPid
+// already does for the exec-driven case, now applied at first attach so a
+// container that will never generate an exec event (it was already running)
+// is not left permanently unresolved.
+func TestAttachContainerSettledTriesProcExeFirst(t *testing.T) {
+	tr, st := newTestTracer(t)
+	self := uint32(os.Getpid())
+	wantExe := selfExeTarget(t)
+
+	if err := tr.AttachContainer(settledTestContainer(self)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+
+	if len(st.openedPaths) != 2 {
+		t.Fatalf("openedPaths = %v, want 2 entries (settled exe, then the ld-cache/OCI path)", st.openedPaths)
+	}
+	if st.openedPaths[0] != wantExe {
+		t.Errorf("openedPaths[0] = %q, want %q (/proc/<pid>/exe must be tried FIRST)", st.openedPaths[0], wantExe)
+	}
+	if st.openedPaths[1] != tr.attachFilePath {
+		t.Errorf("openedPaths[1] = %q, want %q (create-time resolution must still be tried after)", st.openedPaths[1], tr.attachFilePath)
+	}
+}
+
+// TestAttachContainerNotSettledDoesNotTryProcExe is the anti-regression guard
+// the design explicitly calls out: a container discovered PRE-exec (the
+// ordinary fanotify case, SettledAtDiscovery() false) must NEVER have
+// /proc/<pid>/exe resolved at create-time attach, no matter how tempting a
+// unified code path looks later. At the moment fanotify intercepts `runc
+// create`, that pid's exe is runc itself -- a Go binary with crypto/tls
+// linked in -- so resolving it here would let an offset-resolving uprobe
+// gadget attach uprobes to the container runtime host-wide. This test uses a
+// REAL, resolvable pid (self) specifically so that a regression which starts
+// consulting /proc/<pid>/exe for unsettled containers would succeed and be
+// caught, rather than failing closed and hiding the bug.
+func TestAttachContainerNotSettledDoesNotTryProcExe(t *testing.T) {
+	tr, st := newTestTracer(t)
+	self := uint32(os.Getpid())
+
+	if err := tr.AttachContainer(testContainer(self)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+
+	if len(st.openedPaths) != 1 {
+		t.Fatalf("openedPaths = %v, want exactly 1 entry -- /proc/<pid>/exe must not be tried for an unsettled container", st.openedPaths)
+	}
+	if st.openedPaths[0] != tr.attachFilePath {
+		t.Errorf("openedPaths[0] = %q, want %q", st.openedPaths[0], tr.attachFilePath)
+	}
+}
+
+// TestAttachSettledPendingDrainTriesProcExe covers the OTHER settled entry
+// point: a container discovered (and marked settled) before AttachProg has
+// loaded the eBPF program goes through the pending-container drain (attach ->
+// attachSettled), not attachContainerWork. Without this path also honouring
+// the flag, every container node-agent learns about during its own startup
+// window -- exactly the population settledAtDiscovery exists to fix -- would
+// silently fall back to the unsettled resolution order.
+func TestAttachSettledPendingDrainTriesProcExe(t *testing.T) {
+	tr, st := newTestTracer(t)
+	tr.prog = nil // force pending mode: AttachContainer only queues the pid
+	self := uint32(os.Getpid())
+	wantExe := selfExeTarget(t)
+
+	if err := tr.AttachContainer(settledTestContainer(self)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	if _, pending := tr.pendingContainerPids[self]; !pending {
+		t.Fatalf("pid not recorded as pending (prog == nil should have deferred it)")
+	}
+
+	if err := tr.AttachProg(tr.progName, tr.progType, tr.attachFilePath+":"+tr.attachSymbol, &ebpf.Program{}); err != nil {
+		t.Fatalf("AttachProg: %v", err)
+	}
+
+	if len(st.openedPaths) != 2 {
+		t.Fatalf("openedPaths = %v, want 2 entries (settled exe, then the ld-cache/OCI path)", st.openedPaths)
+	}
+	if st.openedPaths[0] != wantExe {
+		t.Errorf("openedPaths[0] = %q, want %q (pending drain must also try /proc/<pid>/exe first)", st.openedPaths[0], wantExe)
+	}
+}
+
+// TestReattachAfterSettledAttachIdempotent checks that a settled first-attach
+// and a subsequent exec-driven ReattachContainerPid agree on the same inode:
+// the container's process hasn't actually re-exec'd, so re-attaching must be
+// a no-op, exactly like TestReattachIdempotentSameInode's unsettled case.
+func TestReattachAfterSettledAttachIdempotent(t *testing.T) {
+	tr, st := newTestTracer(t)
+	st.currentInode = 100
+	self := uint32(os.Getpid())
+
+	if err := tr.AttachContainer(settledTestContainer(self)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	attachedAfterFirst := st.attachCount
+	if attachedAfterFirst == 0 {
+		t.Fatalf("settled attach bound nothing (attachCount=0); nothing to check idempotency of")
+	}
+
+	for i := 0; i < 5; i++ {
+		if err := tr.ReattachContainerPid(self); err != nil {
+			t.Fatalf("ReattachContainerPid #%d: %v", i, err)
+		}
+	}
+
+	if st.attachCount != attachedAfterFirst {
+		t.Errorf("attachCount = %d after reattach loop, want %d (same inode, must not re-attach)", st.attachCount, attachedAfterFirst)
+	}
+}
+
+// TestDetachContainerClearsSettled pins that DetachContainer removes the
+// settled bookkeeping alongside containerPid2OciConfig/containerPid2ExeTarget,
+// so a container ID reused later by an unrelated, unsettled container cannot
+// inherit a stale "settled" flag from this tracer's own map.
+func TestDetachContainerClearsSettled(t *testing.T) {
+	tr, _ := newTestTracer(t)
+
+	if err := tr.AttachContainer(settledTestContainer(fakePid)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	if !tr.containerPidSettled[fakePid] {
+		t.Fatalf("containerPidSettled[pid] = false right after a settled AttachContainer, want true")
+	}
+
+	if err := tr.DetachContainer(testContainer(fakePid)); err != nil {
+		t.Fatalf("DetachContainer: %v", err)
+	}
+	if _, ok := tr.containerPidSettled[fakePid]; ok {
+		t.Errorf("containerPidSettled still has pid after DetachContainer")
 	}
 }

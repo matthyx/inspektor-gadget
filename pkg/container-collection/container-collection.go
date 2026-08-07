@@ -113,7 +113,15 @@ func (cc *ContainerCollection) Initialize(options ...ContainerCollectionOption) 
 	// Consume initial containers that might have been fetched by
 	// functional options. This is done after all functional options have
 	// been called, so that cc.containerEnrichers is fully set up.
+	//
+	// This is the ONLY place settledAtDiscovery may be set true: every
+	// initial container was already running (and had already execve'd its
+	// entrypoint) before we started watching, unlike a fanotify-discovered
+	// container, whose pid is still the runc shim at the moment it is added.
+	// See the field's doc comment in containers.go for why getting this wrong
+	// is a safety issue, not just a missed optimisation.
 	for _, container := range cc.initialContainers {
+		container.settledAtDiscovery = true
 		cc.AddContainer(container)
 	}
 	cc.initialContainers = nil
@@ -214,8 +222,25 @@ func (cc *ContainerCollection) AddContainer(container *Container) {
 		}
 	}
 
-	_, loaded := cc.containers.LoadOrStore(container.Runtime.ContainerID, container)
+	existing, loaded := cc.containers.LoadOrStore(container.Runtime.ContainerID, container)
 	if loaded {
+		// Another discovery source already added this container ID; this one
+		// is discarded. Release the ns fds the WithTracerCollection enricher
+		// may have opened on it above, or they leak for the container's
+		// lifetime -- container.close() on the WINNING container (closed via
+		// RemoveContainer) never touches this one.
+		container.close()
+		if container.OciConfig != "" && existing.(*Container).OciConfig == "" {
+			// Surfaced at Warn rather than silently dropped: a discarded
+			// duplicate that carried OCI config data the stored container
+			// lacks is exactly the shape of bug that cost a full deployment
+			// cycle to diagnose once already. This does not merge the data in
+			// -- Container has no mutex and is read concurrently by every
+			// subscriber, so mutating the stored object here would be a data
+			// race - it only makes the discard observable.
+			log.Warnf("container-collection: discarding a second add for container %s with non-empty OciConfig; the already-stored container has none",
+				container.Runtime.ContainerID)
+		}
 		return
 	}
 	cc.mu.Lock()

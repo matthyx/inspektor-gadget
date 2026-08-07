@@ -138,6 +138,17 @@ type Tracer[Event any] struct {
 	// can still resolve the executable once the program loads.
 	containerPid2OciConfig map[uint32]string
 
+	// containerPidSettled mirrors containercollection.Container.SettledAtDiscovery()
+	// for each attached/pending container PID, recorded at AttachContainer. True
+	// means the container was already running (its process had already execve'd)
+	// when it was discovered, so /proc/<pid>/exe is the settled target executable
+	// rather than the runtime shim -- the same distinction ReattachContainerPid
+	// already exploits for exec-driven re-attach, here applied at the FIRST
+	// attach instead of waiting for an exec event that, for a container
+	// discovered post-exec, will never come. See attachSettled and
+	// attachContainerWork.
+	containerPidSettled map[uint32]bool
+
 	// keeps the last /proc/<pid>/exe symlink target re-resolved for each PID by
 	// ReattachContainerPid. Used as a cheap guard so an exec storm that does not
 	// change the settled executable short-circuits before the open/inode work.
@@ -245,6 +256,7 @@ type attachJob struct {
 	attachSymbol   string
 	progName       string
 	ociConfig      string
+	settled        bool
 }
 
 func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
@@ -253,6 +265,7 @@ func NewTracer[Event any](logger logger.Logger) (*Tracer[Event], error) {
 		inodeRefCount:          make(map[uint64]*inodeKeeper),
 		pendingContainerPids:   make(map[uint32]bool),
 		containerPid2OciConfig: make(map[uint32]string),
+		containerPidSettled:    make(map[uint32]bool),
 		containerPid2ExeTarget: make(map[uint32]string),
 		mappedLibAttached:      make(map[uint32]bool),
 		openInContainer:        secureopen.OpenInContainer,
@@ -774,6 +787,10 @@ func (t *Tracer[Event]) commitOpenedTargets(containerPid uint32, opened []opened
 
 // try attaching to a container, will update `containerPid2Inodes`
 func (t *Tracer[Event]) attach(containerPid uint32) {
+	if t.containerPidSettled[containerPid] {
+		t.attachSettled(containerPid)
+		return
+	}
 	unsecuredAttachFilePaths, err := t.searchForLibrary(containerPid)
 	if err != nil {
 		t.logger.Debugf("attaching to container %d: %s", containerPid, err.Error())
@@ -818,6 +835,48 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 		t.logger.Infof("uprobetracer: attached %q to container pid %d at %v", t.progName, containerPid, unsecuredAttachFilePaths)
 	} else {
 		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: resolved %v but bound 0 (symbol absent, or open/link failed: %v)", t.progName, containerPid, unsecuredAttachFilePaths, lastErr)
+	}
+}
+
+// attachSettled is attach's counterpart for a container discovered post-exec
+// (containerPidSettled[containerPid] true — see Container.SettledAtDiscovery).
+// It tries /proc/<pid>/exe first, ahead of the create-time OCI/ld-cache
+// resolution, and routes through openTargets/commitOpenedTargets so a
+// registered offset resolver is actually consulted — attach's own
+// attachOneFile loop deliberately is not (see attachOneFile's doc comment),
+// which is exactly the gap that leaves a probe-ID-only gadget (no symbol name
+// to fall back to) attaching nothing for every container this tracer learns
+// about before AttachProg's program has finished loading.
+//
+// Caller holds t.mu throughout, same as attach(): this is the pending-drain
+// path invoked once from AttachProg, not the per-container-start hot path
+// (that's attachContainerWork, which already unlocks around its own I/O), so
+// matching attach()'s existing lock discipline here is not a new cost.
+func (t *Tracer[Event]) attachSettled(containerPid uint32) {
+	var unsecuredAttachFilePaths []string
+	if exe, ok := t.settledExecutablePath(containerPid); ok {
+		unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, exe)
+	}
+	libPaths, err := t.resolveLibraryPaths(containerPid, t.attachFilePath, t.containerPid2OciConfig[containerPid])
+	if err != nil {
+		t.logger.Debugf("attaching to container %d: %s", containerPid, err.Error())
+	}
+	unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, libPaths...)
+
+	if len(unsecuredAttachFilePaths) == 0 {
+		t.logger.Debugf("cannot find file to attach in container %d for symbol %q", containerPid, t.attachSymbol)
+		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: no attach target for symbol %q (searchForLibrary err: %v)", t.progName, containerPid, t.attachSymbol, err)
+		t.containerPid2Inodes[containerPid] = nil
+		return
+	}
+
+	opened, _ := t.openTargets(containerPid, unsecuredAttachFilePaths)
+	t.commitOpenedTargets(containerPid, opened)
+
+	if inodes := t.containerPid2Inodes[containerPid]; len(inodes) > 0 {
+		t.logger.Infof("uprobetracer: attached %q to container pid %d at %v", t.progName, containerPid, unsecuredAttachFilePaths)
+	} else {
+		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: resolved %v but bound 0 (symbol absent, or open/link failed)", t.progName, containerPid, unsecuredAttachFilePaths)
 	}
 }
 
@@ -1158,6 +1217,8 @@ func (t *Tracer[Event]) AttachContainer(container *containercollection.Container
 	// Record the OCI config so the attach can resolve a statically-linked symbol to
 	// the container's executable via the OCI spec.
 	t.containerPid2OciConfig[pid] = container.OciConfig
+	settled := container.SettledAtDiscovery()
+	t.containerPidSettled[pid] = settled
 	if t.prog == nil {
 		_, exist := t.pendingContainerPids[pid]
 		if exist {
@@ -1176,7 +1237,7 @@ func (t *Tracer[Event]) AttachContainer(container *containercollection.Container
 	// it and the dup-check above stays authoritative; the attach itself runs off
 	// this path.
 	t.containerPid2Inodes[pid] = nil
-	job := attachJob{pid: pid, attachFilePath: t.attachFilePath, attachSymbol: t.attachSymbol, progName: t.progName, ociConfig: container.OciConfig}
+	job := attachJob{pid: pid, attachFilePath: t.attachFilePath, attachSymbol: t.attachSymbol, progName: t.progName, ociConfig: container.OciConfig, settled: settled}
 	runInline := t.syncAttach
 	if !runInline {
 		// Add UNDER the lock so it orders with Close (which sets closed under the
@@ -1219,10 +1280,24 @@ func (t *Tracer[Event]) attachContainerWork(job attachJob) {
 	}
 	t.mu.Unlock()
 
-	paths, err := t.resolveLibraryPaths(job.pid, job.attachFilePath, job.ociConfig)
+	// job.settled means containercollection observed this container AFTER its
+	// entrypoint had already execve'd (see Container.SettledAtDiscovery), so
+	// unlike the general create-time case /proc/<pid>/exe already names the
+	// settled executable rather than the runtime shim. Try it first, exactly
+	// as ReattachContainerPid does for the exec-driven case -- this is the
+	// same distinction, just recognised at first attach instead of waiting for
+	// an exec event that a pre-existing container will never generate.
+	var paths []string
+	if job.settled {
+		if exe, ok := t.settledExecutablePath(job.pid); ok {
+			paths = append(paths, exe)
+		}
+	}
+	libPaths, err := t.resolveLibraryPaths(job.pid, job.attachFilePath, job.ociConfig)
 	if err != nil {
 		t.logger.Debugf("attaching to container %d: %s", job.pid, err.Error())
 	}
+	paths = append(paths, libPaths...)
 	if len(paths) == 0 {
 		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: no attach target for symbol %q", job.progName, job.pid, job.attachSymbol)
 		return
@@ -1257,6 +1332,7 @@ func (t *Tracer[Event]) DetachContainer(container *containercollection.Container
 
 	pid := container.ContainerPid()
 	delete(t.containerPid2OciConfig, pid)
+	delete(t.containerPidSettled, pid)
 	delete(t.containerPid2ExeTarget, pid)
 	delete(t.mappedLibAttached, pid)
 	if t.prog == nil {
