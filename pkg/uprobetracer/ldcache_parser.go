@@ -16,6 +16,7 @@ package uprobetracer
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -139,8 +140,8 @@ func readCacheFormat2(data []byte) []ldEntry {
 // simulate the loader's behaviour, find library path in containers' `/etc/ld.so.cache`.
 // see https://github.com/bminor/glibc/blob/master/elf/cache.c#L292, the `print_cache` func
 // see https://github.com/iovisor/bcc/blob/master/src/cc/bcc_proc.c#L508, the `bcc_procutils_which_so` func
-func parseLdCache(containerPid uint32, ldCachePath string, libraryName string) ([]string, error) {
-	ldCacheFile, err := secureopen.ReadFileInContainer(containerPid, ldCachePath, ldCacheMaxSize)
+func parseLdCache(ctx context.Context, containerPid uint32, ldCachePath string, libraryName string) ([]string, error) {
+	ldCacheFile, err := secureopen.ReadFileInContainer(ctx, containerPid, ldCachePath, ldCacheMaxSize)
 	if err != nil {
 		return nil, fmt.Errorf("reading file %q in container pid %d: %w", ldCachePath, containerPid, err)
 	}

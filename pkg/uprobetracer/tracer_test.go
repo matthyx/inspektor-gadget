@@ -15,6 +15,7 @@
 package uprobetracer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -47,7 +48,7 @@ type testState struct {
 	openedPaths []string   // every path passed to openInContainer, in call order
 }
 
-func (s *testState) open(_ uint32, filePath string) (*os.File, error) {
+func (s *testState) open(_ context.Context, _ uint32, filePath string) (*os.File, error) {
 	s.openedPaths = append(s.openedPaths, filePath)
 	if s.openErr != nil {
 		return nil, s.openErr
@@ -342,7 +343,7 @@ func TestResolveLibraryPathsFallsBackWhenLdCacheAbsent(t *testing.T) {
 	const wantExe = "/usr/local/bin/myapp"
 	ociConfig := `{"process":{"args":["` + wantExe + `"]}}`
 
-	paths, err := tr.resolveLibraryPaths(fakePid, "libssl.so.3", ociConfig)
+	paths, err := tr.resolveLibraryPaths(context.Background(), fakePid, "libssl.so.3", ociConfig)
 	if err != nil {
 		t.Fatalf("resolveLibraryPaths: %v, want no error (ld cache absence must fall through to the OCI-config exe)", err)
 	}
@@ -398,10 +399,10 @@ func TestAttachContainerDoesNotBlockOnSlowOpen(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	// Park the background attach inside openInContainer.
-	tr.openInContainer = func(pid uint32, path string) (*os.File, error) {
+	tr.openInContainer = func(ctx context.Context, pid uint32, path string) (*os.File, error) {
 		once.Do(func() { close(entered) })
 		<-release
-		return st.open(pid, path)
+		return st.open(ctx, pid, path)
 	}
 
 	done := make(chan error, 1)
@@ -444,10 +445,10 @@ func parkedOpenTracer(t *testing.T) (tr *Tracer[any], st *testState, entered, re
 	entered = make(chan struct{})
 	release = make(chan struct{})
 	var once sync.Once
-	tr.openInContainer = func(pid uint32, path string) (*os.File, error) {
+	tr.openInContainer = func(ctx context.Context, pid uint32, path string) (*os.File, error) {
 		once.Do(func() { close(entered) })
 		<-release
-		return st.open(pid, path)
+		return st.open(ctx, pid, path)
 	}
 	return tr, st, entered, release
 }
@@ -515,10 +516,10 @@ func TestReattachDoesNotHoldLockDuringIO(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	// Park the reattach INSIDE openInContainer — i.e. in the lock-free Phase 1.
-	tr.openInContainer = func(pid uint32, path string) (*os.File, error) {
+	tr.openInContainer = func(ctx context.Context, pid uint32, path string) (*os.File, error) {
 		once.Do(func() { close(entered) })
 		<-release
-		return st.open(pid, path)
+		return st.open(ctx, pid, path)
 	}
 
 	tr.containerPid2Inodes[fakePid] = nil // seed pid as tracked

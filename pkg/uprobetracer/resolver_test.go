@@ -148,7 +148,7 @@ func newResolverTracerWithBuildID(t *testing.T, progType ProgType, symbol string
 	tr.progType = progType
 	tr.attachSymbol = symbol
 	elfFile := writeSyntheticELF(t, buildID)
-	tr.openInContainer = func(_ uint32, _ string) (*os.File, error) {
+	tr.openInContainer = func(_ context.Context, _ uint32, _ string) (*os.File, error) {
 		f, err := os.Open(elfFile.Name())
 		if err != nil {
 			return nil, err
@@ -267,7 +267,7 @@ func TestCommitPhaseDoesNoFileWorkWithPreResolvedOffset(t *testing.T) {
 		return 0x4000, nil
 	})
 
-	f, err := tr.openInContainer(fakePid, "/lib/libtest.so")
+	f, err := tr.openInContainer(context.Background(), fakePid, "/lib/libtest.so")
 	if err != nil {
 		t.Fatalf("opening candidate: %v", err)
 	}

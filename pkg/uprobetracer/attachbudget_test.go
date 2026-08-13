@@ -15,6 +15,7 @@
 package uprobetracer
 
 import (
+	"context"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -131,7 +132,7 @@ func TestSharedAttachSemaphoreCapsSiblingTracers(t *testing.T) {
 
 		var mu sync.Mutex
 		inner := st.open
-		tr.openInContainer = func(pid uint32, path string) (*os.File, error) {
+		tr.openInContainer = func(ctx context.Context, pid uint32, path string) (*os.File, error) {
 			n := live.Add(1)
 			for {
 				old := peak.Load()
@@ -143,7 +144,7 @@ func TestSharedAttachSemaphoreCapsSiblingTracers(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 			live.Add(-1)
 			mu.Lock()
-			f, err := inner(pid, path)
+			f, err := inner(ctx, pid, path)
 			mu.Unlock()
 			opens.Done()
 			return f, err

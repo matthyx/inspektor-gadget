@@ -32,6 +32,7 @@
 package uprobetracer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -165,7 +166,7 @@ type Tracer[Event any] struct {
 	// seams over the impure operations, so the refcount/attach bookkeeping can be
 	// unit-tested without a kernel or live containers. They default to the real
 	// implementations in NewTracer and are only overridden in tests.
-	openInContainer func(containerPid uint32, filePath string) (*os.File, error)
+	openInContainer func(ctx context.Context, containerPid uint32, filePath string) (*os.File, error)
 	readRealInode   func(fd int) (uint64, error)
 	// attachToFile attaches to an already-open candidate, returning one link per
 	// bound probe site. offsets are the file offsets resolved during the
@@ -254,6 +255,36 @@ type Tracer[Event any] struct {
 // ~1 GB transient working set; on a node whose every already-running container
 // reaches the settled-attach path at startup that is the OOM, not a spike.
 const maxConcurrentAttaches = 2
+
+// attachIOTimeout bounds ONE resolve+open I/O phase -- the ld.so.cache read
+// plus every candidate's mount-namespace switch and openat2 -- for a single
+// container attach or exec-driven re-attach.
+//
+// It does not, and cannot, reclaim the goroutine/OS thread a wedged setns/
+// openat2 is blocked in (see secureopen.OpenInContainer); what it bounds is
+// how long the CALLER'S gate stays held by one stuck target:
+//   - attachContainerWork's caller holds an attachSem slot (2 process-wide) for
+//     the duration -- past this bound, a single wedged container would
+//     otherwise starve every other container's create-time attach behind the
+//     same 2 slots forever (confirmed on a real cluster: 15 goroutines queued
+//     318-526 minutes behind exactly this).
+//   - ReattachContainerPid's caller runs inside the per-subscriber goroutine
+//     that containercollection's pubsub.Publish spawns for the EventTypeExec-
+//     Container notification, and Publish blocks synchronously in wg.Wait()
+//     until that goroutine returns -- which in turn is called from the
+//     SINGLE goroutine draining the kernel exec-events ringbuf
+//     (watchExecEvents). Past this bound, one wedged exec-driven reattach
+//     does not just leak a goroutine, it permanently stops the ringbuf from
+//     ever being drained again, silently disabling exec-driven re-attach for
+//     every container on the node from that moment on.
+//
+// Picked generously above any legitimate mount-namespace switch plus a small
+// ld.so.cache read (normally sub-millisecond) so it only fires on a genuine
+// kernel-level wedge, not ordinary contention. See armosec/private-node-agent#480.
+//
+// A var, not a const, solely so tests can shrink it around a simulated stuck
+// open instead of a real multi-second sleep.
+var attachIOTimeout = 15 * time.Second
 
 // globalAttachSem is the default attach semaphore, shared PROCESS-WIDE by every
 // Tracer built by NewTracer.
@@ -449,8 +480,8 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 // searchForLibrary resolves the attach target paths using the tracer's recorded
 // state. Caller holds t.mu (it reads containerPid2OciConfig). The lock-free hot
 // paths call resolveLibraryPaths directly with snapshotted inputs instead.
-func (t *Tracer[Event]) searchForLibrary(containerPid uint32) ([]string, error) {
-	return t.resolveLibraryPaths(containerPid, t.attachFilePath, t.containerPid2OciConfig[containerPid])
+func (t *Tracer[Event]) searchForLibrary(ctx context.Context, containerPid uint32) ([]string, error) {
+	return t.resolveLibraryPaths(ctx, containerPid, t.attachFilePath, t.containerPid2OciConfig[containerPid])
 }
 
 // resolveLibraryPaths resolves the in-container paths to open for the uprobe
@@ -459,13 +490,13 @@ func (t *Tracer[Event]) searchForLibrary(containerPid uint32) ([]string, error) 
 // The ld.so.cache parse it performs is I/O that must not be done under the lock
 // (an exec storm holding t.mu across this work starves the create-time
 // AttachContainer that sits on the synchronous container-start path).
-func (t *Tracer[Event]) resolveLibraryPaths(containerPid uint32, attachFilePath, ociConfig string) ([]string, error) {
+func (t *Tracer[Event]) resolveLibraryPaths(ctx context.Context, containerPid uint32, attachFilePath, ociConfig string) ([]string, error) {
 	if filepath.IsAbs(attachFilePath) {
 		return []string{attachFilePath}, nil
 	}
 
 	ldCachePath := "/etc/ld.so.cache"
-	ldCachePaths, err := parseLdCache(containerPid, ldCachePath, attachFilePath)
+	ldCachePaths, err := parseLdCache(ctx, containerPid, ldCachePath, attachFilePath)
 	// A missing ld.so.cache is not a parse failure to report, it is the expected
 	// state of any container with no glibc at all -- which is precisely the
 	// "statically-linked runtime" case the OCI-config fallback below exists to
@@ -769,11 +800,11 @@ func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, la
 // reaching a statically-linked target (at create time the library is not in the
 // container's ld.so.cache, so nothing resolves). The omission is a deliberate
 // no-op, not an oversight — revisit only if that bail-out condition changes.
-func (t *Tracer[Event]) attachOneFile(containerPid uint32, filePath string, existing map[uint64]bool) (uint64, bool, error) {
+func (t *Tracer[Event]) attachOneFile(ctx context.Context, containerPid uint32, filePath string, existing map[uint64]bool) (uint64, bool, error) {
 	// OpenInContainer returns a fd without O_PATH. This is necessary because
 	// ReadRealInodeFromFd needs the private_data field in kernel "struct file"
 	// to reach the underlying inode through overlayFS; O_PATH zeroes that field.
-	file, err := t.openInContainer(containerPid, filePath)
+	file, err := t.openInContainer(ctx, containerPid, filePath)
 	if err != nil {
 		return 0, false, fmt.Errorf("opening file %q for uprobe: %w", filePath, err)
 	}
@@ -810,13 +841,13 @@ type openedTarget struct {
 // plus whether any open failed, so a caller's retry guard (e.g.
 // ReattachContainerPid's exe-target record) can avoid latching a target that was
 // not fully attached.
-func (t *Tracer[Event]) openTargets(containerPid uint32, paths []string) ([]openedTarget, bool) {
+func (t *Tracer[Event]) openTargets(ctx context.Context, containerPid uint32, paths []string) ([]openedTarget, bool) {
 	var opened []openedTarget
 	openFailed := false
 	for _, filePath := range paths {
 		// OpenInContainer returns a fd without O_PATH: ReadRealInodeFromFd needs the
 		// kernel "struct file" private_data to reach the overlay's real inode.
-		file, err := t.openInContainer(containerPid, filePath)
+		file, err := t.openInContainer(ctx, containerPid, filePath)
 		if err != nil {
 			t.logger.Debugf("opening file %q for uprobe: %v", filePath, err)
 			openFailed = true
@@ -918,7 +949,10 @@ func (t *Tracer[Event]) commitOpenedTargets(containerPid uint32, opened []opened
 // node-agent on smaller instance types within a minute of startup on a real
 // cluster.
 func (t *Tracer[Event]) attach(containerPid uint32) {
-	unsecuredAttachFilePaths, err := t.searchForLibrary(containerPid)
+	ctx, cancel := context.WithTimeout(context.Background(), attachIOTimeout)
+	defer cancel()
+
+	unsecuredAttachFilePaths, err := t.searchForLibrary(ctx, containerPid)
 	if err != nil {
 		t.logger.Debugf("attaching to container %d: %s", containerPid, err.Error())
 	}
@@ -939,7 +973,7 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 	var attachedRealInodes []uint64
 	var lastErr error
 	for _, filePath := range unsecuredAttachFilePaths {
-		realInodePtr, added, err := t.attachOneFile(containerPid, filePath, existing)
+		realInodePtr, added, err := t.attachOneFile(ctx, containerPid, filePath, existing)
 		if err != nil {
 			t.logger.Debugf("%s", err.Error())
 			lastErr = err
@@ -1028,6 +1062,14 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 		return nil
 	}
 
+	// This call is reached from the single goroutine that drains the kernel
+	// exec-events ringbuf (via a synchronous PubSub.Publish that blocks on it) --
+	// see attachIOTimeout's doc comment. Bounding it here is what keeps one
+	// wedged setns/openat2 from permanently stopping exec-driven re-attach for
+	// every container on the node.
+	ctx, cancel := context.WithTimeout(context.Background(), attachIOTimeout)
+	defer cancel()
+
 	// At exec time the settled binary is /proc/<pid>/exe: for statically-linked
 	// runtimes the target symbol lives there, not in a shared library. Resolve it
 	// first, then fall back to the normal create-time resolution (absolute path,
@@ -1036,13 +1078,13 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 	if exe, ok := t.settledExecutablePath(containerPid); ok {
 		unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, exe)
 	}
-	libPaths, err := t.resolveLibraryPaths(containerPid, attachFilePath, ociConfig)
+	libPaths, err := t.resolveLibraryPaths(ctx, containerPid, attachFilePath, ociConfig)
 	if err != nil {
 		t.logger.Debugf("re-attaching to container %d: %s", containerPid, err.Error())
 	}
 	unsecuredAttachFilePaths = dedupPaths(append(unsecuredAttachFilePaths, libPaths...))
 
-	opened, openFailed := t.openTargets(containerPid, unsecuredAttachFilePaths)
+	opened, openFailed := t.openTargets(ctx, containerPid, unsecuredAttachFilePaths)
 
 	// Phase 2 (lock): re-validate the pid is still tracked — it may have been
 	// detached during the lock-free window, and committing then would leak a uprobe
@@ -1368,6 +1410,12 @@ func (t *Tracer[Event]) attachContainerWork(job attachJob) {
 	}
 	t.mu.Unlock()
 
+	// Bounds this job's resolve+open phase so a wedged setns/openat2 releases
+	// its attachSem slot instead of starving every other container queued
+	// behind the same process-wide budget forever; see attachIOTimeout.
+	ctx, cancel := context.WithTimeout(context.Background(), attachIOTimeout)
+	defer cancel()
+
 	// job.settled means containercollection observed this container AFTER its
 	// entrypoint had already execve'd (see Container.SettledAtDiscovery), so
 	// unlike the general create-time case /proc/<pid>/exe already names the
@@ -1381,7 +1429,7 @@ func (t *Tracer[Event]) attachContainerWork(job attachJob) {
 			paths = append(paths, exe)
 		}
 	}
-	libPaths, err := t.resolveLibraryPaths(job.pid, job.attachFilePath, job.ociConfig)
+	libPaths, err := t.resolveLibraryPaths(ctx, job.pid, job.attachFilePath, job.ociConfig)
 	if err != nil {
 		t.logger.Debugf("attaching to container %d: %s", job.pid, err.Error())
 	}
@@ -1390,7 +1438,7 @@ func (t *Tracer[Event]) attachContainerWork(job attachJob) {
 		t.logger.Infof("uprobetracer: %q NOT attached to container pid %d: no attach target for symbol %q", job.progName, job.pid, job.attachSymbol)
 		return
 	}
-	opened, _ := t.openTargets(job.pid, paths)
+	opened, _ := t.openTargets(ctx, job.pid, paths)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
