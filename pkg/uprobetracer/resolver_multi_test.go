@@ -15,6 +15,7 @@
 package uprobetracer
 
 import (
+	"context"
 	"debug/elf"
 	"errors"
 	"os"
@@ -530,7 +531,7 @@ func TestCreateTimeAttachCountsResolverBypass(t *testing.T) {
 	st.currentInode = 614
 
 	tr.mu.Lock()
-	_, _, err := tr.attachOneFile(fakePid, "/lib/libtest.so", map[uint64]bool{})
+	_, _, err := tr.attachOneFile(context.Background(), fakePid, "/lib/libtest.so", map[uint64]bool{})
 	tr.mu.Unlock()
 	if err != nil {
 		t.Fatalf("attachOneFile: %v", err)
@@ -543,7 +544,7 @@ func TestCreateTimeAttachCountsResolverBypass(t *testing.T) {
 	st.currentInode = 615
 
 	tr.mu.Lock()
-	_, _, err = tr.attachOneFile(fakePid, "/lib/libtest.so", map[uint64]bool{})
+	_, _, err = tr.attachOneFile(context.Background(), fakePid, "/lib/libtest.so", map[uint64]bool{})
 	tr.mu.Unlock()
 	if err != nil {
 		t.Fatalf("attachOneFile: %v", err)

@@ -17,6 +17,7 @@
 package secureopen
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -40,7 +41,47 @@ import (
 //
 // Requires Linux 5.6 for openat2:
 // https://github.com/torvalds/linux/commit/fddb5d430ad9fa91b49b1d34d0202ffe2fa0e179
-func OpenInContainer(containerPid uint32, unsafePath string) (*os.File, error) {
+//
+// ctx bounds how long the CALLER waits, not how long the underlying setns/
+// openat2 syscalls run: those are raw blocking kernel calls with no
+// cancellable variant, so a wedged one (a stuck mount namespace, a hung
+// overlay/network filesystem) still burns its goroutine and OS thread for as
+// long as the kernel call itself takes -- this cannot fix that. What it does
+// is stop the caller from waiting on it forever: on ctx's deadline this
+// returns ctx.Err() immediately and hands the still-running open off to a
+// detached goroutine that closes the file if/when it eventually shows up, so
+// a caller-side gate (an attach semaphore slot, or the single fanotify
+// exec-event dispatch goroutine a synchronous PubSub.Publish blocks) is
+// released instead of held forever by one wedged target. See
+// armosec/private-node-agent#480.
+func OpenInContainer(ctx context.Context, containerPid uint32, unsafePath string) (*os.File, error) {
+	type result struct {
+		file *os.File
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		f, err := openInContainer(containerPid, unsafePath)
+		ch <- result{f, err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.file, r.err
+	case <-ctx.Done():
+		go func() {
+			r := <-ch
+			if r.file != nil {
+				r.file.Close()
+			}
+		}()
+		return nil, fmt.Errorf("open %q in container %d: %w", unsafePath, containerPid, ctx.Err())
+	}
+}
+
+// openInContainer is the actual, uninterruptible open; see OpenInContainer's
+// doc comment for why it is wrapped rather than made cancellable itself.
+func openInContainer(containerPid uint32, unsafePath string) (*os.File, error) {
 	root := filepath.Join(host.HostProcFs, fmt.Sprint(containerPid), "root")
 	rootDir, err := os.OpenFile(root, unix.O_PATH, 0)
 	if err != nil {
@@ -79,16 +120,37 @@ func OpenInContainer(containerPid uint32, unsafePath string) (*os.File, error) {
 // ReadFileInContainer reads the named file and returns the contents.
 //
 // This is similar to os.ReadFile() except the file is opened with
-// OpenInContainer().
-func ReadFileInContainer(containerPid uint32, unsafePath string, limitBytes int64) ([]byte, error) {
-	fh, err := OpenInContainer(containerPid, unsafePath)
+// OpenInContainer(). See OpenInContainer's doc comment for what ctx does and
+// does not bound; the read phase gets the same treatment since a container
+// rootfs can be backed by a filesystem whose regular-file reads block (e.g.
+// a wedged overlay/network mount), not just its directory resolution.
+func ReadFileInContainer(ctx context.Context, containerPid uint32, unsafePath string, limitBytes int64) ([]byte, error) {
+	fh, err := OpenInContainer(ctx, containerPid, unsafePath)
 	if err != nil {
 		return nil, fmt.Errorf("secureopen: %w", err)
 	}
 	defer fh.Close()
 
-	if limitBytes > 0 {
-		return io.ReadAll(io.LimitReader(fh, limitBytes))
+	type result struct {
+		data []byte
+		err  error
 	}
-	return io.ReadAll(fh)
+	ch := make(chan result, 1)
+	go func() {
+		var data []byte
+		var err error
+		if limitBytes > 0 {
+			data, err = io.ReadAll(io.LimitReader(fh, limitBytes))
+		} else {
+			data, err = io.ReadAll(fh)
+		}
+		ch <- result{data, err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.data, r.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("read %q in container %d: %w", unsafePath, containerPid, ctx.Err())
+	}
 }
