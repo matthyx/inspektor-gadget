@@ -1115,15 +1115,21 @@ func (i *ebpfInstance) AttachContainer(container *containercollection.Container)
 }
 
 // ReattachContainer re-drives uprobe attachment for an already-tracked
-// container after its process has settled into its final executable (exec).
-// Only uprobe tracers need this: for statically-linked runtimes the create-time
-// attach bound the runc shim's inode, so the symbol's real inode only appears
-// once the container execve's into its binary. Network/tc tracers attach to
-// interfaces, not executables, so they are not re-driven here. ReattachContainerPid
-// is idempotent, so this is safe to call repeatedly.
-func (i *ebpfInstance) ReattachContainer(container *containercollection.Container) error {
+// container after a process inside it has settled into its final executable
+// (exec). Only uprobe tracers need this: for statically-linked runtimes the
+// create-time attach bound the runc shim's inode, so the symbol's real inode
+// only appears once the process execve's into its binary. Network/tc tracers
+// attach to interfaces, not executables, so they are not re-driven here.
+// ReattachContainerExecPid is idempotent, so this is safe to call repeatedly.
+//
+// execPid is the pid that actually executed (see PubSubEvent.ExecPid): for a
+// forked child of the container's tracked process (e.g. a
+// `while true; do <bin>; done` wrapper loop), this differs from
+// container.ContainerPid(), whose /proc/<pid>/exe never changes in that case
+// and so can never reveal the settled binary on its own.
+func (i *ebpfInstance) ReattachContainer(container *containercollection.Container, execPid uint32) error {
 	for _, handler := range i.uprobeTracers {
-		if err := handler.ReattachContainerPid(container.ContainerPid()); err != nil {
+		if err := handler.ReattachContainerExecPid(container.ContainerPid(), execPid); err != nil {
 			return err
 		}
 	}

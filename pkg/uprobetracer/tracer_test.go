@@ -46,10 +46,12 @@ type testState struct {
 	lastOffsets []uint64   // every offset seen by the last attach
 	lastLinks   int        // links returned by the last attach
 	openedPaths []string   // every path passed to openInContainer, in call order
+	openedPids  []uint32   // every containerPid passed to openInContainer, in call order
 }
 
-func (s *testState) open(_ context.Context, _ uint32, filePath string) (*os.File, error) {
+func (s *testState) open(_ context.Context, pid uint32, filePath string) (*os.File, error) {
 	s.openedPaths = append(s.openedPaths, filePath)
+	s.openedPids = append(s.openedPids, pid)
 	if s.openErr != nil {
 		return nil, s.openErr
 	}
@@ -956,5 +958,153 @@ func TestDetachContainerClearsSettled(t *testing.T) {
 	}
 	if _, ok := tr.containerPidSettled[fakePid]; ok {
 		t.Errorf("containerPidSettled still has pid after DetachContainer")
+	}
+}
+
+// TestReattachContainerExecPidResolvesSettledPathFromExecPid is the core
+// regression test for forked-child TLS talkers (a `while true; do <bin>; done`
+// wrapper loop): the container's tracked pid (fakePid here) never execve's --
+// only the forked child (execPid, "self" here) does -- so /proc/<trackedPid>/exe
+// can never reveal the settled binary and the settled-path resolution must come
+// from execPid instead.
+func TestReattachContainerExecPidResolvesSettledPathFromExecPid(t *testing.T) {
+	tr, _ := newTestTracer(t)
+	self := uint32(os.Getpid())
+	wantExe := selfExeTarget(t)
+
+	tr.containerPid2Inodes[fakePid] = nil // trackedPid reserved, as AttachContainer would do
+
+	if err := tr.ReattachContainerExecPid(fakePid, self); err != nil {
+		t.Fatalf("ReattachContainerExecPid: %v", err)
+	}
+
+	if got := tr.containerPid2ExeTarget[fakePid]; got != wantExe {
+		t.Errorf("containerPid2ExeTarget[trackedPid] = %q, want %q (must resolve from execPid, since trackedPid's own /proc/exe never changes for a forked child)", got, wantExe)
+	}
+}
+
+// TestReattachContainerExecPidOpensViaTrackedPid asserts the open (mount
+// namespace resolution) happens through trackedPid, never execPid: execPid may
+// be a short-lived forked child that has already exited by the time this runs,
+// while trackedPid (the container's own long-lived tracked process) is
+// guaranteed to still be valid and shares the same mount namespace via fork
+// inheritance.
+func TestReattachContainerExecPidOpensViaTrackedPid(t *testing.T) {
+	tr, st := newTestTracer(t)
+	self := uint32(os.Getpid())
+	trackedPid := fakePid
+
+	tr.containerPid2Inodes[trackedPid] = nil
+
+	if err := tr.ReattachContainerExecPid(trackedPid, self); err != nil {
+		t.Fatalf("ReattachContainerExecPid: %v", err)
+	}
+
+	if len(st.openedPids) == 0 {
+		t.Fatalf("openInContainer was never called")
+	}
+	for i, pid := range st.openedPids {
+		if pid != trackedPid {
+			t.Errorf("openedPids[%d] = %d, want %d (trackedPid) -- must never open via execPid %d", i, pid, trackedPid, self)
+		}
+	}
+}
+
+// TestReattachContainerExecPidNoBookkeepingForExecPid asserts that a forked
+// child's exec creates NO new tracked entry keyed by execPid: everything is
+// credited to trackedPid. This is what makes the fix safe with no new "pid
+// exited" cleanup signal -- a wrapper loop forking a fresh child every
+// iteration must not leak one bookkeeping entry per iteration.
+func TestReattachContainerExecPidNoBookkeepingForExecPid(t *testing.T) {
+	tr, st := newTestTracer(t)
+	self := uint32(os.Getpid())
+	trackedPid := fakePid
+	st.currentInode = 700
+
+	tr.containerPid2Inodes[trackedPid] = nil
+
+	if err := tr.ReattachContainerExecPid(trackedPid, self); err != nil {
+		t.Fatalf("ReattachContainerExecPid: %v", err)
+	}
+
+	if _, ok := tr.containerPid2Inodes[self]; ok {
+		t.Errorf("containerPid2Inodes gained an entry keyed by execPid %d (would leak once per forked exec)", self)
+	}
+	if _, ok := tr.containerPid2ExeTarget[self]; ok {
+		t.Errorf("containerPid2ExeTarget gained an entry keyed by execPid %d (would leak once per forked exec)", self)
+	}
+	if got := tr.containerPid2Inodes[trackedPid]; len(got) != 1 || got[0] != 700 {
+		t.Errorf("containerPid2Inodes[trackedPid] = %v, want [700] (attach must be credited to trackedPid)", got)
+	}
+}
+
+// TestReattachContainerExecPidUntrackedTrackedPidIsNoOp mirrors
+// TestReattachUntrackedPidIsNoOp for the split-pid case: the guard must key off
+// trackedPid, not execPid -- a valid, resolvable execPid must not bypass it.
+func TestReattachContainerExecPidUntrackedTrackedPidIsNoOp(t *testing.T) {
+	tr, st := newTestTracer(t)
+	self := uint32(os.Getpid())
+
+	if err := tr.ReattachContainerExecPid(fakePid, self); err != nil {
+		t.Fatalf("ReattachContainerExecPid on untracked trackedPid: %v", err)
+	}
+	if st.attachCount != 0 {
+		t.Errorf("attachCount = %d, want 0 (untracked trackedPid must not fresh-attach even with a valid execPid)", st.attachCount)
+	}
+	if _, ok := tr.containerPid2Inodes[fakePid]; ok {
+		t.Errorf("containerPid2Inodes added entry for untracked trackedPid (would leak)")
+	}
+}
+
+// TestReattachContainerExecPidRepeatedForkExecIsIdempotent simulates several
+// wrapper-loop iterations forking a fresh child pid each time but always
+// exec'ing the same on-disk binary: since execPid changes every call but the
+// resolved path does not, only the FIRST call should attach.
+func TestReattachContainerExecPidRepeatedForkExecIsIdempotent(t *testing.T) {
+	tr, st := newTestTracer(t)
+	self := uint32(os.Getpid())
+	trackedPid := fakePid
+	st.currentInode = 800
+
+	tr.containerPid2Inodes[trackedPid] = nil
+
+	for i := 0; i < 3; i++ {
+		// Each loop iteration is modeled as a distinct forked child that all
+		// happen to resolve to the same settled path (self, in this test) --
+		// exactly what repeated invocations of the same on-disk binary look
+		// like from a wrapper loop.
+		if err := tr.ReattachContainerExecPid(trackedPid, self); err != nil {
+			t.Fatalf("ReattachContainerExecPid #%d: %v", i, err)
+		}
+	}
+
+	if st.attachCount != 1 {
+		t.Errorf("attachCount = %d, want 1 (repeated fork+exec of the same binary must not re-attach)", st.attachCount)
+	}
+	if got := tr.containerPid2Inodes[trackedPid]; len(got) != 1 || got[0] != 800 {
+		t.Errorf("containerPid2Inodes[trackedPid] = %v, want [800]", got)
+	}
+}
+
+// TestReattachContainerPidIsExecPidWrapper pins ReattachContainerPid's
+// contract as the in-place-exec special case of ReattachContainerExecPid
+// (trackedPid == execPid), so existing callers (and the in-place wrapper-exec
+// scenario, e.g. node:20-slim's docker-entrypoint.sh execve'ing into node) keep
+// behaving identically.
+func TestReattachContainerPidIsExecPidWrapper(t *testing.T) {
+	tr, st := newTestTracer(t)
+	st.currentInode = 900
+
+	if err := tr.AttachContainer(testContainer(fakePid)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	if err := tr.ReattachContainerPid(fakePid); err != nil {
+		t.Fatalf("ReattachContainerPid: %v", err)
+	}
+
+	for _, pid := range st.openedPids {
+		if pid != fakePid {
+			t.Errorf("openedPids contains %d, want only %d (trackedPid == execPid for in-place exec)", pid, fakePid)
+		}
 	}
 }

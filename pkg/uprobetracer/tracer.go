@@ -1000,24 +1000,59 @@ func (t *Tracer[Event]) attach(containerPid uint32) {
 }
 
 // ReattachContainerPid re-resolves the attach target for a container PID and
-// attaches the uprobe to any newly-settled executable. It is the load-bearing
-// addition for statically-linked runtimes (Node.js, and Go/Rust binaries that
-// embed OpenSSL/BoringSSL): at container-create time /proc/<pid>/exe still
-// points at the runtime shim (runc), so the create-time attach binds the wrong
-// inode. Calling this after the container's process has execve'd into its final
-// binary re-resolves the executable and attaches to the settled inode.
+// attaches the uprobe to any newly-settled executable. It is a thin wrapper
+// over ReattachContainerExecPid for the in-place-exec case, where the process
+// that execve'd IS the tracked container pid (see that function's doc comment
+// for the general case and for why the two pids can differ).
+func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
+	return t.ReattachContainerExecPid(containerPid, containerPid)
+}
+
+// ReattachContainerExecPid re-resolves the attach target for a tracked
+// container and attaches the uprobe to any newly-settled executable. It is the
+// load-bearing addition for statically-linked runtimes (Node.js, and Go/Rust
+// binaries that embed OpenSSL/BoringSSL): at container-create time
+// /proc/<pid>/exe still points at the runtime shim (runc), so the create-time
+// attach binds the wrong inode. Calling this after a process inside the
+// container has execve'd into its final binary re-resolves the executable and
+// attaches to the settled inode.
+//
+// containerPid is the container's ORIGINAL tracked pid, as recorded by
+// AttachContainer — this is what all bookkeeping (containerPid2Inodes,
+// containerPid2ExeTarget, ...) stays keyed to, and it is also whose mount
+// namespace resolveLibraryPaths/openTargets use to open the settled
+// executable. execPid is the pid that ACTUALLY execve'd, per
+// PubSubEvent.ExecPid: for an in-place wrapper exec (e.g. node:20-slim's
+// docker-entrypoint.sh execve'ing into node) these are the same pid, but for a
+// container's tracked process forking a child that then execve's (e.g. a
+// `while true; do <bin>; done` wrapper loop) they differ — containerPid's own
+// /proc/<pid>/exe never changes in that case (it still names the long-lived
+// wrapper), so only /proc/<execPid>/exe can ever reveal the settled binary.
+//
+// execPid is used ONLY to read /proc/<execPid>/exe (a single, fast procfs
+// readlink) — never to open files or hold any reference — so it is fine for
+// execPid to be short-lived and to have already exited by the time this
+// returns; it need only still exist at the moment the readlink runs. This
+// deliberately creates NO new per-execPid bookkeeping entry: a forked child's
+// exec is credited entirely to containerPid, exactly as if containerPid's own
+// process had settled into that binary, which keeps DetachContainer's existing
+// decrement-once-per-inode cleanup correct with no separate "pid exited"
+// signal needed for the forked child (it shares containerPid's mount
+// namespace via fork, which is why opening the resolved path through
+// containerPid still resolves the same file the forked child sees).
 //
 // It is idempotent and safe to call repeatedly:
-//   - an inode already counted for this pid is a no-op;
+//   - an inode already counted for containerPid is a no-op;
 //   - an inode already counted for another pid only bumps the shared refcount;
-//   - a pid that AttachContainer never recorded (or that DetachContainer has
-//     already cleaned up) is a no-op — fresh-attaching would install a uprobe
-//     link with no DetachContainer to ever release it.
+//   - a containerPid that AttachContainer never recorded (or that
+//     DetachContainer has already cleaned up) is a no-op — fresh-attaching
+//     would install a uprobe link with no DetachContainer to ever release it.
 //
-// containerPid2Inodes[pid] is treated as a SET — each (pid, realInode) holds
-// exactly one reference — so DetachContainer's decrement-once-per-inode logic
-// stays correct across the create-time attach plus N re-attaches.
-func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
+// containerPid2Inodes[containerPid] is treated as a SET — each (pid, realInode)
+// holds exactly one reference — so DetachContainer's decrement-once-per-inode
+// logic stays correct across the create-time attach plus N re-attaches, no
+// matter how many distinct execPids fed into them.
+func (t *Tracer[Event]) ReattachContainerExecPid(containerPid, execPid uint32) error {
 	// Phase 0 (lock): cheap guards + snapshot the inputs the lock-free resolve
 	// needs. The heavy resolve/open I/O below MUST NOT run under t.mu: an exec
 	// storm holding the lock across it starves the create-time AttachContainer
@@ -1051,12 +1086,15 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 
 	// Phase 1 (NO lock): resolve + open the I/O-heavy attach targets.
 	//
-	// exe-inode-change guard: if /proc/<pid>/exe still points at the target we last
-	// *successfully* re-attached for this pid, there is nothing new to attach. The
+	// exe-inode-change guard: if /proc/<execPid>/exe still points at the target
+	// we last *successfully* re-attached for this container, there is nothing
+	// new to attach. Comparing by resolved PATH (not by pid) is what makes this
+	// work across repeated fork+exec of the same binary — execPid is a fresh
+	// pid every loop iteration, but the path it resolves to is unchanged. The
 	// target is recorded only after a clean pass below, so a transient failure
-	// (e.g. racing an overlayfs mount) is retried on the next exec instead of being
-	// permanently short-circuited.
-	exeLink := filepath.Join(host.HostProcFs, fmt.Sprint(containerPid), "exe")
+	// (e.g. racing an overlayfs mount) is retried on the next exec instead of
+	// being permanently short-circuited.
+	exeLink := filepath.Join(host.HostProcFs, fmt.Sprint(execPid), "exe")
 	exeTarget, _ := os.Readlink(exeLink)
 	if exeTarget != "" && haveLastExeTarget && lastExeTarget == exeTarget {
 		return nil
@@ -1070,17 +1108,24 @@ func (t *Tracer[Event]) ReattachContainerPid(containerPid uint32) error {
 	ctx, cancel := context.WithTimeout(context.Background(), attachIOTimeout)
 	defer cancel()
 
-	// At exec time the settled binary is /proc/<pid>/exe: for statically-linked
-	// runtimes the target symbol lives there, not in a shared library. Resolve it
-	// first, then fall back to the normal create-time resolution (absolute path,
-	// ld cache, or OCI process.args[0]) so dynamic-libssl containers keep working.
+	// At exec time the settled binary is /proc/<execPid>/exe: for
+	// statically-linked runtimes the target symbol lives there, not in a shared
+	// library. Resolve it first, then fall back to the normal create-time
+	// resolution (absolute path, ld cache, or OCI process.args[0]) so
+	// dynamic-libssl containers keep working. The library-path fallback and the
+	// open below both use containerPid, not execPid: they need a pid whose
+	// mount namespace stays valid for the duration of this call, and execPid
+	// (a possibly-already-exited forked child) does not promise that, while
+	// containerPid (the container's own long-lived tracked process) does — and
+	// shares the same mount namespace via fork inheritance, so the resolved
+	// path opens identically either way.
 	var unsecuredAttachFilePaths []string
-	if exe, ok := t.settledExecutablePath(containerPid); ok {
+	if exe, ok := t.settledExecutablePath(execPid); ok {
 		unsecuredAttachFilePaths = append(unsecuredAttachFilePaths, exe)
 	}
 	libPaths, err := t.resolveLibraryPaths(ctx, containerPid, attachFilePath, ociConfig)
 	if err != nil {
-		t.logger.Debugf("re-attaching to container %d: %s", containerPid, err.Error())
+		t.logger.Debugf("re-attaching to container %d (exec pid %d): %s", containerPid, execPid, err.Error())
 	}
 	unsecuredAttachFilePaths = dedupPaths(append(unsecuredAttachFilePaths, libPaths...))
 

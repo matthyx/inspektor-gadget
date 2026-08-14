@@ -74,11 +74,18 @@ type MountNsMapSetter interface {
 type Attacher interface {
 	AttachContainer(container *containercollection.Container) error
 	DetachContainer(*containercollection.Container) error
-	// ReattachContainer re-drives attachment after a tracked container's
-	// process has execve'd into its final executable. Needed for uprobe gadgets
-	// targeting statically-linked runtimes, where the create-time attach bound
-	// the runtime shim's inode. Implementations with no uprobes may no-op.
-	ReattachContainer(container *containercollection.Container) error
+	// ReattachContainer re-drives attachment after a process inside a tracked
+	// container has execve'd into its final executable. Needed for uprobe
+	// gadgets targeting statically-linked runtimes, where the create-time
+	// attach bound the runtime shim's inode. Implementations with no uprobes
+	// may no-op.
+	//
+	// execPid is the pid that actually executed, per
+	// containercollection.PubSubEvent.ExecPid: for a forked child of the
+	// container's tracked process (e.g. a `while true; do <bin>; done`
+	// wrapper loop), this differs from container.ContainerPid(), whose
+	// /proc/<pid>/exe never changes in that case.
+	ReattachContainer(container *containercollection.Container, execPid uint32) error
 }
 
 type localManager struct {
@@ -480,9 +487,9 @@ func (l *localManagerTrace) handleGadgetInstance(log logger.Logger) error {
 				container.K8s.ContainerName, container.ContainerPid(), container.Mntns, container.Netns)
 		}
 
-		reattachContainerFunc := func(container *containercollection.Container) {
+		reattachContainerFunc := func(container *containercollection.Container, execPid uint32) {
 			log.Debugf("calling gadget.ReattachContainer()")
-			if err := attacher.ReattachContainer(container); err != nil {
+			if err := attacher.ReattachContainer(container, execPid); err != nil {
 				log.Warnf("re-attaching container %q: %s", container.K8s.ContainerName, err)
 			}
 		}
@@ -501,7 +508,7 @@ func (l *localManagerTrace) handleGadgetInstance(log logger.Logger) error {
 					case containercollection.EventTypeRemoveContainer:
 						detachContainerFunc(event.Container)
 					case containercollection.EventTypeExecContainer:
-						reattachContainerFunc(event.Container)
+						reattachContainerFunc(event.Container, event.ExecPid)
 					case containercollection.EventTypePreCreateContainer:
 						// nothing to do
 					default:

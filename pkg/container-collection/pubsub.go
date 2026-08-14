@@ -76,6 +76,16 @@ type PubSubEvent struct {
 	Timestamp string     `json:"timestamp,omitempty" column:"timestamp,maxWidth:30" columnTags:"runtime"`
 	Type      EventType  `json:"event" column:"event,maxWidth:10" columnTags:"runtime"`
 	Container *Container `json:"container"`
+
+	// ExecPid is set only for EventTypeExecContainer: it is the pid that
+	// actually executed, as observed by the container-hook's ig_sched_exec.
+	// For a container's tracked process forking a child before that child
+	// execve's (e.g. a `while true; do <bin>; done` wrapper loop), this
+	// differs from Container.ContainerPid(), which stays pinned to the
+	// container's original tracked pid -- ContainerPid()'s own /proc/<pid>/exe
+	// never changes in that case, so consumers that need the settled
+	// executable must resolve it from ExecPid instead.
+	ExecPid uint32 `json:"execPid,omitempty"`
 }
 
 // GadgetPubSub provides a synchronous publish subscribe mechanism for gadgets
@@ -118,6 +128,16 @@ func (g *GadgetPubSub) Unsubscribe(key interface{}) {
 }
 
 func (g *GadgetPubSub) Publish(eventType EventType, container *Container) {
+	g.publish(eventType, container, 0)
+}
+
+// PublishExec publishes an EventTypeExecContainer event, carrying the pid that
+// actually executed (see PubSubEvent.ExecPid) alongside the tracked container.
+func (g *GadgetPubSub) PublishExec(container *Container, execPid uint32) {
+	g.publish(EventTypeExecContainer, container, execPid)
+}
+
+func (g *GadgetPubSub) publish(eventType EventType, container *Container, execPid uint32) {
 	// Make a copy so we don't keep the lock while actually publishing
 	g.mu.RLock()
 	copiedSubs := []FuncNotify{}
@@ -134,6 +154,7 @@ func (g *GadgetPubSub) Publish(eventType EventType, container *Container) {
 				Timestamp: time.Now().Format(time.RFC3339),
 				Type:      eventType,
 				Container: container,
+				ExecPid:   execPid,
 			}
 			callback(event)
 			wg.Done()
