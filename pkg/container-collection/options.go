@@ -649,10 +649,13 @@ func WithContainerFanotifyEbpf() ContainerCollectionOption {
 				// A process inside some container execve'd. Resolve the mntns to
 				// a tracked container (non-tracked execs resolve to nil and are
 				// dropped) and republish so uprobe gadgets can re-attach to the
-				// settled executable.
+				// settled executable. notif.ContainerPID is the pid that actually
+				// executed -- for a forked child (not the container's original
+				// tracked pid) this differs from container.ContainerPid(), so it
+				// is carried separately as PubSubEvent.ExecPid rather than discarded.
 				if cc.pubsub != nil {
 					if container := cc.LookupContainerByMntns(notif.MntnsID); container != nil {
-						cc.pubsub.Publish(EventTypeExecContainer, container)
+						cc.pubsub.PublishExec(container, notif.ContainerPID)
 					}
 				}
 			}
