@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -28,6 +29,32 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/kallsyms/symscache"
 )
+
+// sockTimeout bounds every Sendmsg/Read on the tracer's socketpair via
+// SO_SNDTIMEO/SO_RCVTIMEO, set once on the fds at install() time. Loopback,
+// same-process traffic is normally sub-millisecond, so this exists purely to
+// turn a wedge into a bounded, visible error instead of an unbounded hang --
+// see readStructFileFields's doc comment for what wedges without it.
+//
+// A var, not a const, so a test can shrink it around a simulated stuck
+// send/read instead of a real multi-second wait.
+var sockTimeout = 10 * time.Second
+
+// setSockTimeout applies SO_SNDTIMEO and SO_RCVTIMEO to fd. Socket options
+// bound the raw blocking syscalls at the kernel level -- unlike a
+// goroutine+context wrapper, there is no leaked goroutine left holding the fd
+// after a timeout, and no risk of a caller reusing the fd concurrently with an
+// abandoned in-flight operation.
+func setSockTimeout(fd int, d time.Duration) error {
+	tv := unix.NsecToTimeval(d.Nanoseconds())
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO, &tv); err != nil {
+		return fmt.Errorf("setting SO_SNDTIMEO: %w", err)
+	}
+	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+		return fmt.Errorf("setting SO_RCVTIMEO: %w", err)
+	}
+	return nil
+}
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target $TARGET -cc clang -cflags ${CFLAGS} -no-global-types filefields ./bpf/filefields.bpf.c -- -I./bpf/
 
@@ -106,6 +133,15 @@ func (t *Tracer) install() error {
 		return fmt.Errorf("creating socket pair: %w", err)
 	}
 
+	// Bound both ends: readStructFileFields sends on sock[0] and drains the
+	// same message back on sock[1]; see its doc comment for why both matter.
+	if err := setSockTimeout(t.sock[0], sockTimeout); err != nil {
+		return fmt.Errorf("bounding send socket: %w", err)
+	}
+	if err := setSockTimeout(t.sock[1], sockTimeout); err != nil {
+		return fmt.Errorf("bounding drain socket: %w", err)
+	}
+
 	// Find the inode of the socket
 	fdFileInfo, err := os.Stat(fmt.Sprintf("/proc/self/fd/%d", t.sock[0]))
 	if err != nil {
@@ -181,6 +217,21 @@ func (t *Tracer) readStructFileFields(fd int) (*fileFields, error) {
 	err := unix.Sendmsg(t.sock[0], buf, unix.UnixRights(fd), nil, 0)
 	if err != nil {
 		return nil, fmt.Errorf("sending fd: %w", err)
+	}
+
+	// Drain the datagram we just sent back off sock[1]. Nothing else ever
+	// reads that end, so without this every call leaves its message sitting
+	// in the kernel's receive buffer. Once enough calls accumulate to fill
+	// it, a later Sendmsg above blocks forever waiting for space -- while
+	// this call holds the Tracer's t.mu (see sharedTracer/tracerMu in
+	// kfilefields.go), permanently wedging every other caller across every
+	// gadget sharing this process-wide tracer, including uprobe re-attach on
+	// exec. A plain Read (not Recvmsg) is enough: we don't need the
+	// SCM_RIGHTS ancillary data back, just to free the buffer slot; the
+	// kernel safely closes the duplicated fd itself if it's never retrieved.
+	drainBuf := make([]byte, 1)
+	if _, err := unix.Read(t.sock[1], drainBuf); err != nil {
+		return nil, fmt.Errorf("draining fd notification: %w", err)
 	}
 
 	var ff fileFields
