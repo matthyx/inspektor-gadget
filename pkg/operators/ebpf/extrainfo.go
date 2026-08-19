@@ -89,9 +89,9 @@ func (i *ebpfInstance) addExtraInfo(gadgetCtx operators.GadgetContext) error {
 	for name, v := range i.collectionSpec.Variables {
 		variables = append(variables, &extraInfoVariable{
 			Name:   name,
-			Offset: v.Offset(),
-			Size:   v.Size(),
-			Map:    v.MapName(),
+			Offset: uint64(v.Offset),
+			Size:   uint64(v.Size()),
+			Map:    v.SectionName,
 		})
 	}
 	variablesJson, _ := json.Marshal(variables)
