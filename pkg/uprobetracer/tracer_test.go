@@ -911,6 +911,46 @@ func TestAttachSettledPendingDrainTriesProcExe(t *testing.T) {
 	}
 }
 
+// TestAttachProgPendingDrainResolverBackedDoesNotTryProcExe is the pending-drain
+// analogue of TestAttachContainerNotSettledDoesNotTryProcExe: an unsettled,
+// resolver-backed pid queued before AttachProg loads the eBPF program must
+// still never have /proc/<pid>/exe consulted, even though it is now routed
+// through attachContainerWork (not attach()) per AttachProg's dispatch fix for
+// resolver-backed gadgets. Without this fix, the job literal for that
+// fallthrough case hardcoded settled: true, which would have made this
+// resolver-backed unsettled pid consult /proc/<pid>/exe -- for a pid that may
+// still be the pre-execve runc shim, exactly the hazard
+// settledAtDiscovery's doc comment (pkg/container-collection/containers.go)
+// calls safety-critical. Uses a REAL, resolvable pid (self), same rationale as
+// TestAttachContainerNotSettledDoesNotTryProcExe: a regression that starts
+// consulting /proc/<pid>/exe here would succeed and be caught, not fail closed
+// and hide the bug. Revert the job literal back to settled: true to see this
+// test fail with len(openedPaths) == 2, openedPaths[0] == the exe path.
+func TestAttachProgPendingDrainResolverBackedDoesNotTryProcExe(t *testing.T) {
+	tr, st := newTestTracer(t)
+	tr.prog = nil // force pending mode: AttachContainer only queues the pid
+	tr.SetAttachOffsetsResolver(func(AttachRequest) ([]uint64, error) { return nil, nil })
+	self := uint32(os.Getpid())
+
+	if err := tr.AttachContainer(testContainer(self)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	if _, pending := tr.pendingContainerPids[self]; !pending {
+		t.Fatalf("pid not recorded as pending (prog == nil should have deferred it)")
+	}
+
+	if err := tr.AttachProg(tr.progName, tr.progType, tr.attachFilePath+":"+tr.attachSymbol, &ebpf.Program{}); err != nil {
+		t.Fatalf("AttachProg: %v", err)
+	}
+
+	if len(st.openedPaths) != 1 {
+		t.Fatalf("openedPaths = %v, want exactly 1 entry -- /proc/<pid>/exe must not be tried for an unsettled resolver-backed container", st.openedPaths)
+	}
+	if st.openedPaths[0] != tr.attachFilePath {
+		t.Errorf("openedPaths[0] = %q, want %q", st.openedPaths[0], tr.attachFilePath)
+	}
+}
+
 // TestReattachAfterSettledAttachIdempotent checks that a settled first-attach
 // and a subsequent exec-driven ReattachContainerPid agree on the same inode:
 // the container's process hasn't actually re-exec'd, so re-attaching must be

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
 )
 
@@ -202,6 +203,47 @@ func TestResolvedOffsetReachesUretprobeAttach(t *testing.T) {
 	}
 	if sawPid != fakePid {
 		t.Errorf("resolver saw containerPID %d, want %d", sawPid, fakePid)
+	}
+}
+
+// TestAttachProgPendingDrainInvokesResolver is split from
+// TestAttachProgPendingDrainResolverBackedDoesNotTryProcExe (tracer_test.go)
+// because that test's harness (newTestTracer) records openedPaths but its
+// openInContainer never returns a real ELF, so a resolver registered against
+// it is never actually invoked (elf.NewFile fails first) -- unassertable
+// there regardless of the dispatch fix. This test uses the resolver harness
+// (a real synthetic ELF) to positively prove the fix's actual point: an
+// unsettled, resolver-backed pid queued before AttachProg loads the program
+// now reaches the registered resolver and binds at its resolved offset,
+// rather than being routed through attach()/attachOneFile (which would never
+// invoke a resolver at all).
+func TestAttachProgPendingDrainInvokesResolver(t *testing.T) {
+	const wantOffset = uint64(0x3a000)
+	tr, st, _ := newResolverTracer(t, ProgUprobe, "SSL_write")
+	tr.prog = nil // force pending mode: AttachContainer only queues the pid
+	st.currentInode = 700
+
+	tr.SetAttachOffsetResolver(func(*os.File, uint32, string, elf.Machine, string) (uint64, error) {
+		return wantOffset, nil
+	})
+
+	self := uint32(os.Getpid())
+	if err := tr.AttachContainer(testContainer(self)); err != nil {
+		t.Fatalf("AttachContainer: %v", err)
+	}
+	if _, pending := tr.pendingContainerPids[self]; !pending {
+		t.Fatalf("pid not recorded as pending (prog == nil should have deferred it)")
+	}
+
+	if err := tr.AttachProg(tr.progName, tr.progType, tr.attachFilePath+":"+tr.attachSymbol, &ebpf.Program{}); err != nil {
+		t.Fatalf("AttachProg: %v", err)
+	}
+
+	if st.attachCount != 1 {
+		t.Fatalf("attachCount = %d, want 1 -- pending-drain must reach the resolver-backed attach for an unsettled resolver-registered pid", st.attachCount)
+	}
+	if st.lastOffset == nil || *st.lastOffset != wantOffset {
+		t.Errorf("attach offset = %v, want %#x -- the registered resolver's answer must reach the pending-drain attach", st.lastOffset, wantOffset)
 	}
 }
 
