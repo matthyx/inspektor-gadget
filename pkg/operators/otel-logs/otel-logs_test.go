@@ -67,6 +67,7 @@ func (m *mockGadgetContext) Params() []*api.Param                             { 
 func (m *mockGadgetContext) SetParams(params []*api.Param)                    {}
 func (m *mockGadgetContext) SetMetadata(metadata []byte) error                { return nil }
 func (m *mockGadgetContext) OrasTarget() oras.ReadOnlyTarget                  { return nil }
+func (m *mockGadgetContext) ReleaseOrasTarget()                               {}
 func (m *mockGadgetContext) IsRemoteCall() bool                               { return false }
 func (m *mockGadgetContext) IsClient() bool                                   { return false }
 
