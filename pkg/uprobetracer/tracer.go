@@ -221,8 +221,15 @@ type Tracer[Event any] struct {
 	// attached/closed pair whose equality is the leak check.
 	linksRolledBack atomic.Uint64
 
-	// createTimeAttachUnresolved counts create-time (AttachContainer) attaches
-	// that bypassed the resolver entirely; see attachOneFile.
+	// createTimeAttachUnresolved counts create-time attaches via the
+	// AttachProg pending-drain that bypassed the resolver entirely; see
+	// attachOneFile. Since AttachProg now routes unsettled+resolver-backed
+	// pids through attachContainerWork instead (see AttachProg's own
+	// comment), this only increments for gadgets with NO resolver
+	// registered -- it no longer signals lost resolver-backed coverage the
+	// way it did before that fix. Retained (not removed) because
+	// attachOneFile is still directly exercised by non-resolver gadgets
+	// (e.g. SSL/P1) via this same pending-drain path.
 	createTimeAttachUnresolved atomic.Uint64
 
 	// Create-time attach (AttachContainer) is dispatched to bounded background
@@ -425,9 +432,12 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 	// uncapped-concurrency burst sized to the node's ENTIRE container count
 	// at once: confirmed on a real cluster to OOM node-agent on smaller
 	// instance types within the first minute of startup. Unsettled
-	// containers keep the original synchronous path (attach/attachOneFile,
-	// deliberately NOT resolver-backed) unchanged; see attachOneFile's own
-	// doc comment for why.
+	// containers with NO resolver registered (e.g. SSL/P1) keep the
+	// original synchronous path (attach/attachOneFile); unsettled
+	// containers WITH a resolver registered (e.g. gotls) now also route
+	// through the bounded async job dispatch below, since attach()
+	// deliberately never consults a registered resolver -- see
+	// attachOneFile's own doc comment for why.
 	//
 	// syncJobs defers the syncAttach (test-only) inline calls until AFTER
 	// t.mu is released below -- attachContainerWork takes t.mu itself for its
@@ -438,7 +448,20 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 	var syncJobs []attachJob
 	sem := t.attachSem
 	for pid := range t.pendingContainerPids {
-		if !t.containerPidSettled[pid] {
+		// Resolver-backed gadgets (e.g. gotls) skip the cheap unsettled fast
+		// path here: attach() bypasses t.attachOffsetsResolver by design
+		// (see attachOneFile's doc comment), so an unsettled+resolver-backed
+		// pid would otherwise never get a resolver-backed attach attempt at
+		// all until a later exec-driven reattach. Route it through the same
+		// bounded async job dispatch settled pids already use instead, with
+		// settled explicitly carried as t.containerPidSettled[pid] (false in
+		// this branch) -- NOT hardcoded true, which would let
+		// attachContainerWork consult /proc/<pid>/exe for a pid that may
+		// still be the pre-execve runc shim (see settledAtDiscovery's doc
+		// comment in pkg/container-collection/containers.go for why that's
+		// safety-critical). Non-resolver gadgets (SSL/P1) are unaffected --
+		// they keep the fast synchronous path unchanged.
+		if !t.containerPidSettled[pid] && t.attachOffsetsResolver == nil {
 			t.attach(pid)
 			continue
 		}
@@ -448,7 +471,7 @@ func (t *Tracer[Event]) AttachProg(progName string, progType ProgType, attachTo 
 			attachSymbol:   t.attachSymbol,
 			progName:       t.progName,
 			ociConfig:      t.containerPid2OciConfig[pid],
-			settled:        true,
+			settled:        t.containerPidSettled[pid],
 		}
 		// Reserve as tracked before dispatch, mirroring AttachContainer: a
 		// concurrent Reattach/Detach must see this pid immediately, not only
@@ -795,11 +818,15 @@ func (t *Tracer[Event]) attachOneOpenFile(containerPid uint32, file *os.File, la
 // by the Phase-2 refactor — attachOneOpenFile carries the identical bookkeeping.
 // Caller holds t.mu.
 //
-// This path deliberately does NOT consult the AttachOffsetResolver: it is the
-// only remaining caller that opens under t.mu, and it already bails before
-// reaching a statically-linked target (at create time the library is not in the
-// container's ld.so.cache, so nothing resolves). The omission is a deliberate
-// no-op, not an oversight — revisit only if that bail-out condition changes.
+// This path deliberately does NOT consult the AttachOffsetResolver. Its only
+// caller today (attach(), via AttachProg's pending-drain) is now itself gated
+// to the case where NO resolver is registered — a resolver-backed gadget's
+// unsettled pending pids route through attachContainerWork instead (see
+// AttachProg's own comment), where a real ELF parse and offset resolution
+// does run. For the no-resolver population that still reaches this function,
+// the omission remains correct: it already bails before reaching a
+// statically-linked target (at create time the library is not in the
+// container's ld.so.cache, so nothing resolves).
 func (t *Tracer[Event]) attachOneFile(ctx context.Context, containerPid uint32, filePath string, existing map[uint64]bool) (uint64, bool, error) {
 	// OpenInContainer returns a fd without O_PATH. This is necessary because
 	// ReadRealInodeFromFd needs the private_data field in kernel "struct file"
@@ -808,11 +835,14 @@ func (t *Tracer[Event]) attachOneFile(ctx context.Context, containerPid uint32, 
 	if err != nil {
 		return 0, false, fmt.Errorf("opening file %q for uprobe: %w", filePath, err)
 	}
-	// Counted, not just commented: the claim that this path never meets a target
-	// needing an offset is an assumption about what is reachable at create time,
-	// and an assumption on a fail-open path is exactly the kind that stops being
-	// true quietly. A registered resolver plus a rising count here is the signal
-	// that the omission has started costing coverage.
+	// Counted, not just commented. Post-fix, attach() (this function's sole
+	// caller) is only reached when t.attachOffsetsResolver == nil for the
+	// unsettled case, so in normal operation this branch should never fire
+	// in practice for the AttachProg pending-drain path -- it stays as a
+	// defensive counter for any other caller of attachOneFile that might
+	// still have a resolver registered (there are none today; retained as
+	// a tripwire, not deleted, since it costs nothing and the callers of
+	// this function are not sealed against future additions).
 	if t.attachOffsetsResolver != nil {
 		t.createTimeAttachUnresolved.Add(1)
 		t.logger.Debugf("uprobetracer: %q create-time attach to %q for container %d bypassed the offset resolver (count=%d)",
@@ -888,7 +918,8 @@ type TracerStats struct {
 	// These never reached a keeper, so they are outside the Attached/Closed
 	// balance.
 	LinksRolledBack uint64
-	// CreateTimeAttachUnresolved counts create-time attaches that bypassed the
+	// CreateTimeAttachUnresolved counts create-time (pending-drain) attaches
+	// via a no-resolver-registered gadget's fast path that bypassed the
 	// resolver.
 	CreateTimeAttachUnresolved uint64
 }
@@ -1181,7 +1212,9 @@ func (t *Tracer[Event]) reattachMappedLibraries(containerPid uint32, pattern *re
 	}
 	if t.prog == nil {
 		// Pending mode: no program loaded yet; the create-time attach path
-		// (attachOneFile via attach) will run once AttachProg fires.
+		// will run once AttachProg fires -- attachOneFile via attach() for
+		// no-resolver gadgets, or attachContainerWork's bounded async job
+		// for resolver-backed gadgets.
 		return nil
 	}
 
