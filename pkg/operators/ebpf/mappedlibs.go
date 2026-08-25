@@ -130,9 +130,11 @@ func defaultMappedLibBackoffSchedule() []time.Duration {
 // the JVM and the AEAD runtime.node pattern targets Node.js — disjoint runtimes,
 // never co-mapped in the same container. Revisit if a third pattern is added, or
 // if two registered patterns can ever match within the same container.
-var mappedLibPatternMu sync.Mutex
-var mappedLibPatternSources []string
-var mappedLibPatternGlobal atomic.Pointer[regexp.Regexp]
+var (
+	mappedLibPatternMu      sync.Mutex
+	mappedLibPatternSources []string
+	mappedLibPatternGlobal  atomic.Pointer[regexp.Regexp]
+)
 
 // recompileMappedLibPatternLocked rebuilds the union regex from
 // mappedLibPatternSources and republishes it. Caller must hold
