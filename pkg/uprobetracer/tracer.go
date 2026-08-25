@@ -1271,6 +1271,11 @@ func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid uint32, patt
 	if err != nil {
 		return nil, fmt.Errorf("discovering mapped libraries for pid %d: %w", containerPid, err)
 	}
+	paths := make([]string, 0, len(libs))
+	for _, lib := range libs {
+		paths = append(paths, lib.path)
+	}
+	t.logger.Debugf("uprobetracer: discoverAndOpenMappedLibraries: matched=%d pid=%d paths=%v", len(libs), containerPid, paths)
 
 	var opened []mappedOpen
 	for _, lib := range libs {
