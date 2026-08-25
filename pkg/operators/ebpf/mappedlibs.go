@@ -37,13 +37,23 @@ package ebpfoperator
 // NEVER under t.mu. The timer goroutine only acquires t.mu transiently inside
 // ReattachContainerMappedLibsPid / HasMappedLibForPid. The registry has its own
 // dedicated mutex (mappedLibTimersMu), distinct from both i.mu and any t.mu.
+// Each registry entry additionally has its own mutex (e.mu) guarding its
+// tracked-execPid set (e.pids). The ONLY acquisition order is r.mu -> e.mu
+// (inside arm(), which holds r.mu for its whole body); e.mu is NEVER held
+// across a pass() call, and therefore never across any uprobe tracer's t.mu —
+// snapshotPids() fully unlocks before its return value is used.
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
 // Retry-window constants, derived from the Phase-0.1 droplet measurement of the
@@ -213,11 +223,25 @@ func SetMappedLibPattern(pattern *regexp.Regexp) {
 	recompileMappedLibPatternLocked()
 }
 
+// mappedLibMaxTrackedPids bounds the per-entry set of candidate execPids that
+// every pass scans.
+//
+// PROPOSED VALUE, not a settled one: the right sizing quantity is "distinct
+// execs by ANY process in this container within the up-to-mappedLibRetryCeiling
+// window" — container-hook filters exec events only by mount-namespace
+// membership, and every re-arm extends the window — for which no real
+// measurement exists yet. The per-pass instrumentation in runMappedLibPass
+// exists to collect that data; re-derive this value against it rather than
+// treating 64 as established.
+const mappedLibMaxTrackedPids = 64
+
 // mappedLibTimerEntry is one container's live retry timer. It is keyed in the
-// registry on containerPid (the cancellation identity), but carries execPid as a
-// MUTABLE scan target: a re-arm from a later exec updates the slot in place and
-// the running goroutine re-reads it on every pass, rather than the target being
-// frozen at arm time and a second exec's pid being silently discarded.
+// registry on containerPid (the cancellation identity), and carries a BOUNDED
+// SET of candidate execPids: a re-arm from a later exec ADDS its pid to the set
+// (capacity-bounded) rather than overwriting a single slot, and the running
+// goroutine rescans the whole set on every pass. A single-slot design only ever
+// remembered the most recent exec, so under a real exec storm any candidate
+// other than the very last one was evicted before it could ever be rescanned.
 //
 // Registry invariant: r.timers[cp] == e ⟹ exactly one live goroutine owns e. e
 // leaves the map only via cancel/cancelAll, or via that goroutine immediately
@@ -226,15 +250,87 @@ func SetMappedLibPattern(pattern *regexp.Regexp) {
 // (<-i.done), ceiling — drop a racing bump deliberately, which is safe because
 // removal-then-return leaves the next arm() free to create a fresh entry rather
 // than dedup against a dead one. (This clause concerns the generation/
-// budget-reset signal only, not the mutable scan target — the re-armed
-// e.execPid is re-read by the running goroutine on every pass regardless of
-// gen; only the retry-budget-reset signal is disposition-gated as described
-// here.) Every exit path in armMappedLibTimer is derived from this invariant,
-// not patched independently.
+// budget-reset signal only, not the tracked set — a pid added to e.pids is
+// re-read by the running goroutine on every pass regardless of gen; only the
+// retry-budget-reset signal is disposition-gated as described here.) Every exit
+// path in armMappedLibTimer is derived from this invariant, not patched
+// independently.
+//
+// Lock ordering: the only acquisition order is r.mu -> e.mu (inside arm(),
+// which holds r.mu for its whole body). e.mu is NEVER held across a pass() call
+// or therefore across any uprobe tracer's t.mu. e.pids is initialized non-nil
+// at construction (the one call site inside arm()) and never reassigned to nil
+// afterward — addPid and snapshotPids may assume a non-nil map.
 type mappedLibTimerEntry struct {
-	stop    chan struct{}
-	execPid atomic.Uint32 // latest exec'd pid to scan; updated in place on re-arm
-	gen     atomic.Uint64 // bumped on every re-arm; see rearmedOrRetire
+	stop chan struct{}
+	gen  atomic.Uint64 // bumped on every re-arm; see rearmedOrRetire
+
+	mu   sync.Mutex
+	pids map[uint32]struct{} // bounded set of candidate execPids scanned every pass; never nil after construction
+}
+
+// addPid inserts execPid into the tracked set if not already present, evicting
+// one arbitrary entry if already at capacity (Go's randomized map iteration
+// order makes this a random-ish eviction, not LRU). Eviction-under-normal-load
+// is a live risk, not a settled non-issue — see mappedLibMaxTrackedPids' doc
+// comment. A no-op if execPid is already tracked (duplicate exec-events for the
+// same pid must not grow the set).
+func (e *mappedLibTimerEntry) addPid(execPid uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, exists := e.pids[execPid]; exists {
+		return
+	}
+	if len(e.pids) >= mappedLibMaxTrackedPids {
+		for k := range e.pids {
+			delete(e.pids, k)
+			break
+		}
+	}
+	e.pids[execPid] = struct{}{}
+}
+
+// pruneDead removes deadPids from the tracked set. Called by the goroutine
+// after a pass that identified specific pids as confirmed-gone. This does NOT
+// save per-candidate scan cost — a dead pid already short-circuits cheaply
+// today via readProcMntns failing before any /proc/<pid>/maps walk. Its purpose
+// is freeing capacity: a confirmed-dead slot no longer occupies room in the
+// bounded set, so it can't cause a still-live, still-relevant candidate to be
+// arbitrarily evicted once the cap is reached.
+func (e *mappedLibTimerEntry) pruneDead(deadPids []uint32) {
+	if len(deadPids) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, pid := range deadPids {
+		delete(e.pids, pid)
+	}
+}
+
+// snapshotPids returns a point-in-time copy of the tracked set for a pass to
+// scan. Copying (not returning the live map) means the pass can run lock-free,
+// and a concurrent addPid during the pass is safely picked up on the NEXT pass,
+// not lost — the added pid stays in e.pids either way.
+func (e *mappedLibTimerEntry) snapshotPids() []uint32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]uint32, 0, len(e.pids))
+	for pid := range e.pids {
+		out = append(out, pid)
+	}
+	return out
+}
+
+// isPidAlive reports whether execPid still has a procfs directory under
+// host.HostProcFs. Used to prune confirmed-dead candidates from an entry's
+// tracked set so they cannot occupy capacity that a still-live, still-relevant
+// candidate needs. Routed through host.HostProcFs (rather than unix.Kill(pid,
+// 0), which is simpler but not mockable) so tests can fake liveness by
+// overriding that var.
+func isPidAlive(execPid uint32) bool {
+	_, err := os.Stat(filepath.Join(host.HostProcFs, strconv.FormatUint(uint64(execPid), 10)))
+	return err == nil
 }
 
 // mappedLibTimer is the per-containerPid retry-timer registry on the
@@ -254,19 +350,22 @@ func newMappedLibTimerRegistry() *mappedLibTimerRegistry {
 
 // arm starts a retry goroutine for containerPid unless one is already armed
 // (dedup). It returns the new entry, or nil if one already existed — in which
-// case the existing entry's scan target is refreshed to execPid and its
-// generation bumped, so the already-running goroutine picks up the newer exec
-// instead of the re-arm being dropped. The caller runs the goroutine body.
+// case execPid is added to the existing entry's tracked set and its generation
+// bumped, so the already-running goroutine picks up the newer exec (alongside
+// the candidates it is already tracking) instead of the re-arm being dropped.
+// The caller runs the goroutine body.
 func (r *mappedLibTimerRegistry) arm(containerPid, execPid uint32) (*mappedLibTimerEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if existing, exists := r.timers[containerPid]; exists {
-		existing.execPid.Store(execPid)
+		existing.addPid(execPid)
 		existing.gen.Add(1)
 		return nil, false
 	}
-	entry := &mappedLibTimerEntry{stop: make(chan struct{})}
-	entry.execPid.Store(execPid)
+	entry := &mappedLibTimerEntry{
+		stop: make(chan struct{}),
+		pids: map[uint32]struct{}{execPid: {}},
+	}
 	r.timers[containerPid] = entry
 	r.wg.Add(1)
 	return entry, true
@@ -339,11 +438,12 @@ func (r *mappedLibTimerRegistry) cancelAll() {
 // the attempt cap is hit, or the wall-clock ceiling expires. It is a no-op when
 // the feature is off (nil pattern).
 //
-// containerPid is the dedup/cancellation key; execPid is the pid whose procfs
-// the pass actually scans. A re-arm with a later execPid does not start a second
-// goroutine — it updates the live entry's scan target and resets the running
+// containerPid is the dedup/cancellation key; execPid is a pid whose procfs the
+// pass scans. A re-arm with a later execPid does not start a second goroutine —
+// it adds execPid to the live entry's tracked set and resets the running
 // goroutine's attempt budget, so an exec storm cannot exhaust the budget on
-// early short-lived execs before the real target settles.
+// early short-lived execs before the real target settles, and cannot evict an
+// earlier candidate that has not yet had a chance to map the library.
 //
 // Lock order: the goroutine takes a uprobe tracer's t.mu only transiently inside
 // the public Tracer methods. It NEVER holds t.mu across the stop-channel select.
@@ -357,8 +457,9 @@ func (i *ebpfInstance) armMappedLibTimer(containerPid, execPid uint32) {
 	entry, armed := i.mappedLibTimers.arm(containerPid, execPid)
 	if !armed {
 		// Already armed for this container (a duplicate exec/reattach): do not
-		// double-arm. arm() has refreshed the existing entry's scan target and
-		// bumped its generation, so the running goroutine picks up this exec.
+		// double-arm. arm() has added execPid to the existing entry's tracked
+		// set and bumped its generation, so the running goroutine picks up this
+		// exec.
 		return
 	}
 
@@ -389,9 +490,11 @@ func (i *ebpfInstance) armMappedLibTimer(containerPid, execPid uint32) {
 				i.mappedLibTimers.retire(containerPid, entry) // path 5: wall-clock ceiling
 				return
 			}
-			// Fan out a discovery+attach pass, re-reading the scan target so a
+			// Fan out a discovery+attach pass, re-reading the tracked set so a
 			// re-arm that landed since the last pass is picked up.
-			if pass(containerPid, entry.execPid.Load(), pattern) {
+			attached, deadPids := pass(containerPid, entry.snapshotPids(), pattern, start.Add(mappedLibRetryCeiling))
+			entry.pruneDead(deadPids)
+			if attached {
 				// "attempt %d" is relative to the CURRENT generation: after a
 				// budget reset a later pass can log a low attempt number.
 				i.logger.Debugf("ebpf: mapped-lib retry timer for pid %d: attached on attempt %d", containerPid, attempt+1)
@@ -427,22 +530,97 @@ func (i *ebpfInstance) armMappedLibTimer(containerPid, execPid uint32) {
 	}()
 }
 
+// mappedLibHandler is the narrow view of *uprobetracer.Tracer[T] that
+// fanOutMappedLibPass needs. Extracting it lets the per-handler-fairness
+// fan-out logic below be unit-tested with lightweight fakes instead of a real
+// eBPF tracer (i.uprobeTracers's element type carries a live eBPF program and
+// cannot be constructed cheaply in a table test).
+type mappedLibHandler interface {
+	HasMappedLibForPid(containerPid uint32) bool
+	ReattachContainerMappedLibsPid(containerPid, execPid uint32, pattern *regexp.Regexp) error
+}
+
 // runMappedLibPass runs one discovery+attach pass across all uprobe tracers for
-// containerPid, scanning execPid's procfs, and reports whether the targeted
-// library is now attached on any tracer. Re-scan is scoped to tracers that do
-// NOT yet report the lib for this container.
-func (i *ebpfInstance) runMappedLibPass(containerPid, execPid uint32, pattern *regexp.Regexp) bool {
-	anyAttached := false
-	for _, handler := range i.uprobeTracers {
+// containerPid, scanning each of execPids' procfs, and reports whether the
+// targeted library is now attached on any tracer, alongside any candidates a
+// cheap liveness pre-check confirmed are gone (so the caller can prune them
+// from the tracked set). Re-scan is scoped to tracers that do NOT yet report
+// the lib for this container. deadline is the calling goroutine's own
+// wall-clock ceiling, used to bound how far a single pass can run past it.
+func (i *ebpfInstance) runMappedLibPass(containerPid uint32, execPids []uint32, pattern *regexp.Regexp, deadline time.Time) (anyAttached bool, deadPids []uint32) {
+	// Per-pass instrumentation: duration, containerPid and the FULL execPids
+	// slice (not just its length), so these lines join exactly against
+	// uprobetracer's own "matched=%d containerPid=%d execPid=%d" discovery line
+	// on a node where several containers arm a timer concurrently.
+	passStart := time.Now()
+	defer func() {
+		i.logger.Debugf("ebpf: mapped-lib pass for containerPid %d execPids %v took %s", containerPid, execPids, time.Since(passStart))
+	}()
+
+	// Liveness checked ONCE per candidate, hoisted above the per-tracer loop
+	// below -- both cheaper (candidates x 1 checks, not candidates x N-tracers)
+	// and what makes "collected once" true rather than merely harmless.
+	live := make([]uint32, 0, len(execPids))
+	for _, execPid := range execPids {
+		if isPidAlive(execPid) {
+			live = append(live, execPid)
+		} else {
+			deadPids = append(deadPids, execPid)
+		}
+	}
+
+	handlers := make(map[string]mappedLibHandler, len(i.uprobeTracers))
+	for name, h := range i.uprobeTracers {
+		handlers[name] = h
+	}
+	anyAttached = fanOutMappedLibPass(handlers, containerPid, live, pattern, deadline, func(execPid uint32, err error) {
+		i.logger.Debugf("ebpf: mapped-lib reattach for containerPid %d execPid %d: %v", containerPid, execPid, err)
+	})
+	return anyAttached, deadPids
+}
+
+// fanOutMappedLibPass calls ReattachContainerMappedLibsPid on every handler not
+// yet satisfied (HasMappedLibForPid), scanning live execPids for each in turn.
+//
+// deadline bounds how long a single handler's OWN execPid scan may run past
+// it -- NOT the whole fan-out. A resolver-backed handler (e.g. AEAD's, whose
+// ReattachContainerMappedLibsPid triggers a multi-hundred-MiB ELF scan per
+// candidate) can legitimately blow through the shared deadline on its own
+// scan; when it does, only ITS remaining execPid candidates are skipped
+// (`break` out of the inner loop), and the outer loop moves on to the next
+// handler, which still gets its own first attempt. Aborting the whole pass on
+// the first overrun (an earlier version of this function did `return` instead
+// of `break` here) meant Go's randomized map iteration order could starve
+// out an entire class of handlers indefinitely: whichever handlers land after
+// the first slow one in a given pass's iteration order get ZERO attempts, and
+// since a starved handler's HasMappedLibForPid never turns true, it starves on
+// every subsequent pass too -- not a one-time slow pass, a permanent miss.
+// This surfaced live: Copilot CLI's runtime.node was correctly discovered and
+// opened via map_files, but the AEAD uprobe handlers (aead_gcm_decrypt_ctr32,
+// aead_chacha20_open, aead_gcm_decrypt_stitched, ...) never appeared in a
+// single discoverAndOpenMappedLibraries/commitMappedLibraries log line against
+// it -- only the cheap, non-resolver-backed gotls handlers ever got a turn.
+//
+// The overrun check runs AFTER ReattachContainerMappedLibsPid returns, so it
+// cannot preempt an in-flight call -- it bounds a handler's own overshoot to
+// AT MOST ONE such call, not chain unboundedly many of them for that handler.
+func fanOutMappedLibPass(handlers map[string]mappedLibHandler, containerPid uint32, live []uint32, pattern *regexp.Regexp, deadline time.Time, onReattachErr func(execPid uint32, err error)) (anyAttached bool) {
+	for _, handler := range handlers {
 		if handler.HasMappedLibForPid(containerPid) {
 			anyAttached = true
 			continue
 		}
-		if err := handler.ReattachContainerMappedLibsPid(containerPid, execPid, pattern); err != nil {
-			i.logger.Debugf("ebpf: mapped-lib reattach for containerPid %d execPid %d: %v", containerPid, execPid, err)
-		}
-		if handler.HasMappedLibForPid(containerPid) {
-			anyAttached = true
+		for _, execPid := range live {
+			if err := handler.ReattachContainerMappedLibsPid(containerPid, execPid, pattern); err != nil {
+				onReattachErr(execPid, err)
+			}
+			if handler.HasMappedLibForPid(containerPid) {
+				anyAttached = true
+				break // this handler is satisfied; stop scanning further candidates FOR IT
+			}
+			if time.Now().After(deadline) {
+				break // this handler's budget is spent; move to the NEXT HANDLER so it still gets its own first attempt (see func doc)
+			}
 		}
 	}
 	return anyAttached

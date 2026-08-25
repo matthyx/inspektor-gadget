@@ -203,7 +203,7 @@ type ebpfInstance struct {
 	mappedLibTimers  *mappedLibTimerRegistry
 	// mappedLibPass is the per-attempt discovery+attach work for the retry timer.
 	// nil in production (the timer uses i.runMappedLibPass); a test seam only.
-	mappedLibPass func(containerPid, execPid uint32, pattern *regexp.Regexp) bool
+	mappedLibPass func(containerPid uint32, execPids []uint32, pattern *regexp.Regexp, deadline time.Time) (bool, []uint32)
 
 	// map from ebpf variable name to ebpfVar struct
 	vars map[string]*ebpfVar
