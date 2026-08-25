@@ -85,7 +85,7 @@ func withEcsEnrichment(cc *ContainerCollection, clusterName, region string) erro
 	// Enrich on AddContainer using the latest cache snapshot (mirrors the K8s enricher model).
 	cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
 		// Skip if already enriched
-		if container.Ecs.BasicEcsMetadata.IsEnriched() {
+		if container.Ecs.IsEnriched() {
 			return true
 		}
 
@@ -147,7 +147,7 @@ func ecsDiscoveryLoop(cc *ContainerCollection, clusterName, region string, cache
 func updateExistingContainersWithEcs(cc *ContainerCollection, cache *ecsCache) {
 	cc.containers.Range(func(key, value any) bool {
 		container := value.(*Container)
-		if container.Ecs.BasicEcsMetadata.IsEnriched() {
+		if container.Ecs.IsEnriched() {
 			return true
 		}
 		runtimeID := container.Runtime.ContainerID

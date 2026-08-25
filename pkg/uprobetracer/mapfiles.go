@@ -196,7 +196,7 @@ func openMapFile(containerPid uint32, rangeKey string, expectedMntns uint64) (*o
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) ||
 			errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
-			return nil, fmt.Errorf("opening %q: %w: %v", mapFilePath, ErrMapFileUnavailable, err)
+			return nil, fmt.Errorf("opening %q: %w: %w", mapFilePath, ErrMapFileUnavailable, err)
 		}
 		return nil, fmt.Errorf("opening %q: %w", mapFilePath, err)
 	}
@@ -206,7 +206,7 @@ func openMapFile(containerPid uint32, rangeKey string, expectedMntns uint64) (*o
 	fi, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, fmt.Errorf("fstat %q: %w: %v", mapFilePath, ErrMapFileUnavailable, err)
+		return nil, fmt.Errorf("fstat %q: %w: %w", mapFilePath, ErrMapFileUnavailable, err)
 	}
 	if !fi.Mode().IsRegular() {
 		f.Close()
@@ -219,7 +219,7 @@ func openMapFile(containerPid uint32, rangeKey string, expectedMntns uint64) (*o
 	currentMntns, err := readProcMntns(containerPid)
 	if err != nil {
 		f.Close()
-		return nil, fmt.Errorf("re-reading mntns for pid %d: %w: %v", containerPid, ErrMapFileUnavailable, err)
+		return nil, fmt.Errorf("re-reading mntns for pid %d: %w: %w", containerPid, ErrMapFileUnavailable, err)
 	}
 	if currentMntns != expectedMntns {
 		f.Close()

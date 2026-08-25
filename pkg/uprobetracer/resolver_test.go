@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+
 	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
 )
 
