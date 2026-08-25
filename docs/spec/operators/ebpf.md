@@ -40,3 +40,21 @@ with `GADGET_MAPITER()`.
 Fully qualified name: `operator.oci.ebpf.map-fetch-count`
 
 Default: `0`
+
+## Go API
+
+### `TriggerManualMapFetch`
+
+`ebpfoperator.TriggerManualMapFetch(names ...string)` requests an immediate,
+out-of-band fetch from every currently running map iterator (see
+`map-fetch-interval`/`map-fetch-count` above), independent of and in addition to
+its normal schedule. With no `names` given, every map iterator running in the
+process is triggered; otherwise only iterators whose datasource name matches one
+of `names` are.
+
+This is for an embedding Go application with a long-running gadget instance that
+needs to recover data sitting in a periodically-polled map before its next
+scheduled fetch — for example, right before the application stops tracking
+whatever produced that data and any not-yet-fetched entries for it become
+unreachable. It does not block until the fetch(es) complete, and is a silent
+no-op for any name with no currently running iterator.
