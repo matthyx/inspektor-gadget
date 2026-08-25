@@ -15,8 +15,12 @@
 package ebpfoperator
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,6 +29,7 @@ import (
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
 // shrinkBackoff replaces the production backoff schedule with near-zero delays
@@ -57,7 +62,7 @@ func shrinkCeiling(t *testing.T, d time.Duration) {
 // newTimerInstance returns a minimal ebpfInstance wired for the retry-timer
 // tests: a non-nil pattern (feature on), a fresh registry, a done channel, and
 // an injected mappedLibPass mock.
-func newTimerInstance(pass func(containerPid, execPid uint32, pattern *regexp.Regexp) bool) *ebpfInstance {
+func newTimerInstance(pass func(containerPid uint32, execPids []uint32, pattern *regexp.Regexp, deadline time.Time) (bool, []uint32)) *ebpfInstance {
 	return &ebpfInstance{
 		logger:           logger.DefaultLogger(),
 		done:             make(chan struct{}),
@@ -85,9 +90,9 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 func TestMappedLibTimerStopsOnSuccess(t *testing.T) {
 	shrinkBackoff(t)
 	var calls atomic.Int32
-	i := newTimerInstance(func(_, _ uint32, _ *regexp.Regexp) bool {
+	i := newTimerInstance(func(_ uint32, _ []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 		calls.Add(1)
-		return true // attached on the first pass
+		return true, nil // attached on the first pass
 	})
 
 	i.armMappedLibTimer(42, 42)
@@ -116,11 +121,12 @@ func TestMappedLibTimerStopsOnSuccess(t *testing.T) {
 func TestReattachContainerArmsTimerWithExecPid(t *testing.T) {
 	shrinkBackoff(t)
 	var calls atomic.Int32
-	var gotContainerPid, gotExecPid uint32
-	i := newTimerInstance(func(containerPid, execPid uint32, _ *regexp.Regexp) bool {
+	var gotContainerPid uint32
+	var gotExecPids []uint32
+	i := newTimerInstance(func(containerPid uint32, execPids []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 		calls.Add(1)
-		gotContainerPid, gotExecPid = containerPid, execPid
-		return true // attached on the first pass
+		gotContainerPid, gotExecPids = containerPid, slices.Clone(execPids)
+		return true, nil // attached on the first pass
 	})
 
 	const containerPid, execPid uint32 = 100, 200
@@ -141,8 +147,8 @@ func TestReattachContainerArmsTimerWithExecPid(t *testing.T) {
 	if gotContainerPid != containerPid {
 		t.Errorf("mappedLibPass containerPid = %d, want %d", gotContainerPid, containerPid)
 	}
-	if gotExecPid != execPid {
-		t.Errorf("mappedLibPass execPid = %d, want %d (the settled exec pid, not container.ContainerPid())", gotExecPid, execPid)
+	if want := []uint32{execPid}; !slices.Equal(gotExecPids, want) {
+		t.Errorf("mappedLibPass execPids = %v, want %v (the settled exec pid, not container.ContainerPid())", gotExecPids, want)
 	}
 }
 
@@ -151,9 +157,9 @@ func TestReattachContainerArmsTimerWithExecPid(t *testing.T) {
 func TestMappedLibTimerStopsAtCap(t *testing.T) {
 	shrinkBackoff(t)
 	var calls atomic.Int32
-	i := newTimerInstance(func(_, _ uint32, _ *regexp.Regexp) bool {
+	i := newTimerInstance(func(_ uint32, _ []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 		calls.Add(1)
-		return false // never attaches
+		return false, nil // never attaches
 	})
 
 	i.armMappedLibTimer(7, 7)
@@ -170,10 +176,10 @@ func TestMappedLibTimerDoubleArmDedup(t *testing.T) {
 	shrinkBackoff(t)
 	var calls atomic.Int32
 	block := make(chan struct{})
-	i := newTimerInstance(func(_, _ uint32, _ *regexp.Regexp) bool {
+	i := newTimerInstance(func(_ uint32, _ []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 		calls.Add(1)
 		<-block // hold the first goroutine so the second arm sees it active
-		return true
+		return true, nil
 	})
 
 	i.armMappedLibTimer(99, 99)
@@ -204,9 +210,9 @@ func TestMappedLibTimerCancelOnDetach(t *testing.T) {
 	t.Cleanup(func() { mappedLibBackoffSchedule = orig })
 
 	var calls atomic.Int32
-	i := newTimerInstance(func(_, _ uint32, _ *regexp.Regexp) bool {
+	i := newTimerInstance(func(_ uint32, _ []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 		calls.Add(1)
-		return false // never attaches; would otherwise sleep 1h
+		return false, nil // never attaches; would otherwise sleep 1h
 	})
 
 	i.armMappedLibTimer(5, 5)
@@ -233,9 +239,9 @@ func TestMappedLibTimerCancelAllNoLeak(t *testing.T) {
 	t.Cleanup(func() { mappedLibBackoffSchedule = orig })
 
 	var started sync.WaitGroup
-	i := newTimerInstance(func(_, _ uint32, _ *regexp.Regexp) bool {
+	i := newTimerInstance(func(_ uint32, _ []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 		started.Done()
-		return false
+		return false, nil
 	})
 
 	baseline := runtime.NumGoroutine()
@@ -260,9 +266,9 @@ func TestMappedLibTimerNilPatternNoArm(t *testing.T) {
 		done:             make(chan struct{}),
 		mappedLibPattern: nil, // feature OFF
 		mappedLibTimers:  newMappedLibTimerRegistry(),
-		mappedLibPass: func(_, _ uint32, _ *regexp.Regexp) bool {
+		mappedLibPass: func(_ uint32, _ []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 			calls.Add(1)
-			return false
+			return false, nil
 		},
 	}
 
@@ -293,9 +299,9 @@ func TestMappedLibTimerDoneChannelStops(t *testing.T) {
 	t.Cleanup(func() { mappedLibBackoffSchedule = orig })
 
 	var calls atomic.Int32
-	i := newTimerInstance(func(_, _ uint32, _ *regexp.Regexp) bool {
+	i := newTimerInstance(func(_ uint32, _ []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 		calls.Add(1)
-		return false
+		return false, nil
 	})
 
 	i.armMappedLibTimer(3, 3)
@@ -309,19 +315,34 @@ func TestMappedLibTimerDoneChannelStops(t *testing.T) {
 }
 
 // mappedLibPassCall records one mappedLibPass invocation's arguments, so a test
-// can assert WHICH pid a given pass actually scanned (not just how many passes
-// ran).
-type mappedLibPassCall struct{ containerPid, execPid uint32 }
+// can assert WHICH pids a given pass actually scanned (not just how many
+// passes ran). execPids must be cloned by the caller (slices.Clone) before
+// being stored here, since the mock's own execPids argument is a snapshot the
+// caller may reuse.
+type mappedLibPassCall struct {
+	containerPid uint32
+	execPids     []uint32
+}
+
+// sortedPids returns a sorted copy of pids, so a test can compare two tracked
+// sets for set equality: snapshotPids builds its slice by ranging over a map,
+// whose iteration order Go deliberately randomizes, so the arrival order of
+// candidates is NOT preserved and must never be asserted on.
+func sortedPids(pids []uint32) []uint32 {
+	out := slices.Clone(pids)
+	slices.Sort(out)
+	return out
+}
 
 // TestMappedLibTimerRearm covers the re-arm semantics of the timer registry: a
-// second exec for an already-armed container updates the LIVE scan target
+// second exec for an already-armed container updates the LIVE tracked set
 // instead of being dropped or starting a second goroutine, refreshes the
 // attempt budget, and — when the wall-clock ceiling fires with a re-arm pending
 // — still removes the registry entry rather than orphaning it.
 func TestMappedLibTimerRearm(t *testing.T) {
-	// A: a re-arm reaches the running goroutine's next pass, and does not start
-	// a second goroutine.
-	t.Run("updates_live_scan_target_and_dedups", func(t *testing.T) {
+	// A: a re-arm reaches the running goroutine's next pass ALONGSIDE the
+	// candidate already tracked, and does not start a second goroutine.
+	t.Run("tracks_both_candidates_and_dedups", func(t *testing.T) {
 		shrinkBackoff(t)
 
 		var (
@@ -332,12 +353,12 @@ func TestMappedLibTimerRearm(t *testing.T) {
 		block := make(chan struct{})
 		// Records BEFORE parking: the waitFor handshake below would otherwise
 		// deadlock waiting for a record that only appears once block is released.
-		i := newTimerInstance(func(containerPid, execPid uint32, _ *regexp.Regexp) bool {
+		i := newTimerInstance(func(containerPid uint32, execPids []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 			mu.Lock()
-			calls = append(calls, mappedLibPassCall{containerPid, execPid})
+			calls = append(calls, mappedLibPassCall{containerPid, slices.Clone(execPids)})
 			mu.Unlock()
 			once.Do(func() { <-block }) // only the FIRST pass parks
-			return false                // never attaches
+			return false, nil           // never attaches
 		})
 
 		i.armMappedLibTimer(100, 200)
@@ -345,7 +366,7 @@ func TestMappedLibTimerRearm(t *testing.T) {
 		mu.Lock()
 		first := calls[0]
 		mu.Unlock()
-		if want := (mappedLibPassCall{100, 200}); first != want {
+		if want := (mappedLibPassCall{100, []uint32{200}}); first.containerPid != want.containerPid || !slices.Equal(first.execPids, want.execPids) {
 			t.Fatalf("calls[0] = %+v, want %+v", first, want)
 		}
 
@@ -374,8 +395,12 @@ func TestMappedLibTimerRearm(t *testing.T) {
 		mu.Lock()
 		second := calls[1]
 		mu.Unlock()
-		if want := (mappedLibPassCall{100, 999}); second != want {
-			t.Errorf("calls[1] = %+v, want %+v (re-armed execPid must reach the running goroutine)", second, want)
+		// The tracked set RETAINS 200 and ADDS 999 — this is the assertion that
+		// fails under the old single-slot design (which would report just
+		// {999}) and passes under the set-based one. Compared set-equal, since
+		// snapshotPids' order is map-iteration order, not arrival order.
+		if want := []uint32{200, 999}; second.containerPid != 100 || !slices.Equal(sortedPids(second.execPids), want) {
+			t.Errorf("calls[1] = %+v, want containerPid 100 and execPids set %v (the re-armed pid must reach the running goroutine WITHOUT evicting the earlier candidate)", second, want)
 		}
 
 		// Self-terminates: this test's own re-arm bumped gen to 1, so the second
@@ -393,15 +418,15 @@ func TestMappedLibTimerRearm(t *testing.T) {
 			calls []mappedLibPassCall
 		)
 		block := make(chan struct{})
-		i := newTimerInstance(func(containerPid, execPid uint32, _ *regexp.Regexp) bool {
+		i := newTimerInstance(func(containerPid uint32, execPids []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 			mu.Lock()
-			calls = append(calls, mappedLibPassCall{containerPid, execPid})
+			calls = append(calls, mappedLibPassCall{containerPid, slices.Clone(execPids)})
 			n := len(calls)
 			mu.Unlock()
 			if n == mappedLibRetryAttempts {
 				<-block // park the last pass before the cap-reached check
 			}
-			return false
+			return false, nil
 		})
 
 		i.armMappedLibTimer(100, 200)
@@ -416,8 +441,12 @@ func TestMappedLibTimerRearm(t *testing.T) {
 		mu.Lock()
 		afterReset := calls[mappedLibRetryAttempts]
 		mu.Unlock()
-		if want := (mappedLibPassCall{100, 999}); afterReset != want {
-			t.Errorf("first post-reset pass = %+v, want %+v", afterReset, want)
+		// The discriminating property is that the reset genuinely happened AND
+		// reached the newly-armed candidate; the earlier candidate is still
+		// tracked alongside it, so this is a containment check, not an exact
+		// set match.
+		if afterReset.containerPid != 100 || !slices.Contains(afterReset.execPids, uint32(999)) {
+			t.Errorf("first post-reset pass = %+v, want containerPid 100 and execPids containing 999", afterReset)
 		}
 
 		// Self-terminates: the second cap-reached check sees no further re-arm.
@@ -437,12 +466,12 @@ func TestMappedLibTimerRearm(t *testing.T) {
 			once  sync.Once
 		)
 		block := make(chan struct{})
-		i := newTimerInstance(func(containerPid, execPid uint32, _ *regexp.Regexp) bool {
+		i := newTimerInstance(func(containerPid uint32, execPids []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
 			mu.Lock()
-			calls = append(calls, mappedLibPassCall{containerPid, execPid})
+			calls = append(calls, mappedLibPassCall{containerPid, slices.Clone(execPids)})
 			mu.Unlock()
 			once.Do(func() { <-block })
-			return false
+			return false, nil
 		})
 
 		i.armMappedLibTimer(100, 200)
@@ -481,6 +510,166 @@ func TestMappedLibTimerRearm(t *testing.T) {
 			t.Errorf("arm after the ceiling did not create a fresh timer; discovery is wedged")
 		}
 	})
+}
+
+// TestMappedLibTimerRetainsEarlierCandidateAfterEviction is the regression
+// guard for the live-fire bug this design exists to fix: under Copilot CLI's
+// own exec storm, the real target's exec event arrived EARLY and every later
+// exec overwrote the single mutable scan target, permanently evicting it before
+// any backoff-scheduled pass could recheck it. The tracked set must retain the
+// earlier candidate across later re-arms.
+//
+// Discrimination rests on pass #1 deliberately NOT succeeding even though 200
+// is present: only a LATER pass's success proves 200 SURVIVED the re-arms,
+// rather than proving it merely matched before any re-arm could evict it.
+func TestMappedLibTimerRetainsEarlierCandidateAfterEviction(t *testing.T) {
+	shrinkBackoff(t)
+	var (
+		mu    sync.Mutex
+		calls [][]uint32
+		once  sync.Once
+	)
+	block := make(chan struct{})
+	i := newTimerInstance(func(_ uint32, execPids []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
+		mu.Lock()
+		calls = append(calls, slices.Clone(execPids))
+		n := len(calls)
+		mu.Unlock()
+		once.Do(func() { <-block }) // park pass #1 only
+		return n > 1 && slices.Contains(execPids, uint32(200)), nil
+	})
+
+	i.armMappedLibTimer(100, 200) // the real target arms first
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(calls) == 1 }, "first pass to park")
+	mu.Lock()
+	first := calls[0]
+	mu.Unlock()
+	if want := []uint32{200}; !slices.Equal(first, want) {
+		t.Fatalf("calls[0] = %v, want %v", first, want)
+	}
+
+	// While pass #1 is still parked, re-arm with several more pids — under the
+	// old single-slot design each of these would have overwritten (not added
+	// to) the scan target, permanently evicting 200.
+	for p := uint32(201); p <= 205; p++ {
+		i.armMappedLibTimer(100, p)
+	}
+	close(block)
+	i.mappedLibTimers.wg.Wait()
+
+	mu.Lock()
+	later := calls[len(calls)-1]
+	n := len(calls)
+	mu.Unlock()
+	if n < 2 {
+		t.Fatalf("only %d pass(es) ran; need a pass after the re-arms to prove 200 survived", n)
+	}
+	if !slices.Contains(later, uint32(200)) {
+		t.Errorf("later pass execPids = %v, does not contain 200 — the earlier candidate was evicted", later)
+	}
+}
+
+// TestMappedLibTimerPrunesDeadCandidates proves the liveness-pruning mechanism
+// actually removes a confirmed-dead candidate from the tracked set, rather than
+// merely compiling: a pass reports 200 dead, and every later pass must scan the
+// still-live 201 without 200.
+func TestMappedLibTimerPrunesDeadCandidates(t *testing.T) {
+	shrinkBackoff(t)
+	var (
+		mu    sync.Mutex
+		calls [][]uint32
+		once  sync.Once
+	)
+	block := make(chan struct{})
+	i := newTimerInstance(func(_ uint32, execPids []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
+		mu.Lock()
+		calls = append(calls, slices.Clone(execPids))
+		n := len(calls)
+		mu.Unlock()
+		once.Do(func() { <-block }) // park pass #1 only
+		if n == 1 {
+			return false, []uint32{200} // 200 is confirmed gone
+		}
+		return false, nil
+	})
+
+	i.armMappedLibTimer(100, 200)
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(calls) == 1 }, "first pass to park")
+
+	i.armMappedLibTimer(100, 201) // a second, still-live candidate, added while parked
+	close(block)
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(calls) >= 2 }, "a pass after the dead pid was reported")
+
+	mu.Lock()
+	second := calls[1]
+	mu.Unlock()
+	if !slices.Contains(second, uint32(201)) {
+		t.Errorf("calls[1] = %v, does not contain the still-live 201", second)
+	}
+	if slices.Contains(second, uint32(200)) {
+		t.Errorf("calls[1] = %v, still contains 200 — pruneDead did not remove the confirmed-dead candidate", second)
+	}
+
+	// Nothing ever attaches, so the goroutine runs to its cap and retires.
+	i.mappedLibTimers.wg.Wait()
+}
+
+// TestMappedLibTimerTrackedPidsCapped proves the tracked set stays bounded: arm
+// more distinct pids than the cap allows and no pass may ever scan more than
+// mappedLibMaxTrackedPids candidates. The property is asserted over EVERY
+// recorded pass, not one snapshot — an early pass may legitimately record a
+// small length, so a single sample proves nothing.
+func TestMappedLibTimerTrackedPidsCapped(t *testing.T) {
+	shrinkBackoff(t)
+	var (
+		mu      sync.Mutex
+		lengths []int
+	)
+	i := newTimerInstance(func(_ uint32, execPids []uint32, _ *regexp.Regexp, _ time.Time) (bool, []uint32) {
+		mu.Lock()
+		lengths = append(lengths, len(execPids))
+		mu.Unlock()
+		return false, nil // never attaches
+	})
+
+	for p := uint32(1); p <= mappedLibMaxTrackedPids+5; p++ {
+		i.armMappedLibTimer(100, p)
+	}
+	i.mappedLibTimers.wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(lengths) == 0 {
+		t.Fatalf("no passes ran")
+	}
+	for idx, n := range lengths {
+		if n > mappedLibMaxTrackedPids {
+			t.Errorf("pass %d scanned %d candidates, want at most %d", idx, n, mappedLibMaxTrackedPids)
+		}
+	}
+}
+
+// TestIsPidAlive unit-tests the liveness helper against a synthetic procfs
+// root. host.HostProcFs is a process-global, so this test must NOT run
+// t.Parallel() — same constraint the existing HostProcFs-overriding tests in
+// pkg/uprobetracer already observe.
+func TestIsPidAlive(t *testing.T) {
+	dir := t.TempDir()
+	prevProcFs := host.HostProcFs
+	host.HostProcFs = dir
+	t.Cleanup(func() { host.HostProcFs = prevProcFs })
+
+	const livePid, deadPid uint32 = 4242, 4243
+	if err := os.Mkdir(filepath.Join(dir, strconv.FormatUint(uint64(livePid), 10)), 0o755); err != nil {
+		t.Fatalf("creating synthetic procfs entry: %v", err)
+	}
+
+	if !isPidAlive(livePid) {
+		t.Errorf("isPidAlive(%d) = false, want true (its procfs directory exists)", livePid)
+	}
+	if isPidAlive(deadPid) {
+		t.Errorf("isPidAlive(%d) = true, want false (no procfs directory)", deadPid)
+	}
 }
 
 // TestSetMappedLibPattern round-trips through the package-global setter.
