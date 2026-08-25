@@ -203,7 +203,7 @@ type ebpfInstance struct {
 	mappedLibTimers  *mappedLibTimerRegistry
 	// mappedLibPass is the per-attempt discovery+attach work for the retry timer.
 	// nil in production (the timer uses i.runMappedLibPass); a test seam only.
-	mappedLibPass func(pid uint32, pattern *regexp.Regexp) bool
+	mappedLibPass func(containerPid, execPid uint32, pattern *regexp.Regexp) bool
 
 	// map from ebpf variable name to ebpfVar struct
 	vars map[string]*ebpfVar
@@ -1137,10 +1137,13 @@ func (i *ebpfInstance) ReattachContainer(container *containercollection.Containe
 	// P2b: a library like netty-tcnative is dlopen'd seconds AFTER this single
 	// exec event, then unlinked, so the immediate reattach above cannot see it.
 	// When a caller-supplied matcher is set, arm a bounded, self-sustaining retry
-	// timer (deduped per pid) that polls the map_files discovery path until the
-	// lib attaches or the cap is hit. A nil pattern => no timer (feature off).
+	// timer (deduped per container pid) that polls the map_files discovery path
+	// until the lib attaches or the cap is hit. A nil pattern => no timer
+	// (feature off). execPid matters for exactly the same reason it does for
+	// ReattachContainerExecPid above: /proc/<pid>/map_files is pid-specific, so a
+	// forked-child workload is invisible from container.ContainerPid() alone.
 	if i.mappedLibPattern != nil {
-		i.armMappedLibTimer(container.ContainerPid())
+		i.armMappedLibTimer(container.ContainerPid(), execPid)
 	}
 	return nil
 }

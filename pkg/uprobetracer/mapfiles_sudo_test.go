@@ -220,7 +220,7 @@ func runIntegrationWithJVM(t *testing.T, jvmPidVal uint32) {
 	tr.containerPid2Inodes[jvmPidVal] = nil
 
 	// Call reattachMappedLibraries directly (lock already held).
-	if err := tr.reattachMappedLibraries(jvmPidVal, tcnativeRe); err != nil {
+	if err := tr.reattachMappedLibraries(jvmPidVal, jvmPidVal, tcnativeRe); err != nil {
 		tr.mu.Unlock()
 		t.Fatalf("reattachMappedLibraries: %v", err)
 	}
@@ -242,7 +242,7 @@ func runIntegrationWithJVM(t *testing.T, jvmPidVal uint32) {
 
 	// Second call must be idempotent (refcount unchanged).
 	tr.mu.Lock()
-	if err := tr.reattachMappedLibraries(jvmPidVal, tcnativeRe); err != nil {
+	if err := tr.reattachMappedLibraries(jvmPidVal, jvmPidVal, tcnativeRe); err != nil {
 		tr.mu.Unlock()
 		t.Fatalf("reattachMappedLibraries (2nd): %v", err)
 	}
@@ -277,7 +277,7 @@ func runIntegrationWithJVM(t *testing.T, jvmPidVal uint32) {
 	tr.containerPid2Inodes[jvmPidVal] = nil
 	fdWarmBefore := countProcSelfFds(t)
 	tr.mu.Lock()
-	_ = tr.reattachMappedLibraries(jvmPidVal, tcnativeRe)
+	_ = tr.reattachMappedLibraries(jvmPidVal, jvmPidVal, tcnativeRe)
 	tr.mu.Unlock()
 	c2 := &containercollection.Container{}
 	c2.Runtime.ContainerPID = jvmPidVal

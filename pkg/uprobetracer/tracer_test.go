@@ -30,6 +30,7 @@ import (
 
 	containercollection "github.com/inspektor-gadget/inspektor-gadget/pkg/container-collection"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/logger"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
 )
 
 // testState drives the injected uprobetracer seams so the refcount/attach
@@ -592,7 +593,7 @@ func reattachMappedLibrariesLocked[E any](t *testing.T, tr *Tracer[E], pid uint3
 	t.Helper()
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	return tr.reattachMappedLibraries(pid, pattern)
+	return tr.reattachMappedLibraries(pid, pid, pattern)
 }
 
 // TestReattachMappedLibrariesDedup asserts that a .so with multiple VMAs
@@ -732,7 +733,7 @@ func TestReattachContainerMappedLibsPidNilPattern(t *testing.T) {
 	tr, st := newTestTracer(t)
 	tr.containerPid2Inodes[fakePid] = nil
 
-	if err := tr.ReattachContainerMappedLibsPid(fakePid, nil); err != nil {
+	if err := tr.ReattachContainerMappedLibsPid(fakePid, fakePid, nil); err != nil {
 		t.Fatalf("ReattachContainerMappedLibsPid(nil pattern): %v", err)
 	}
 	if st.attachCount != 0 {
@@ -1146,5 +1147,100 @@ func TestReattachContainerPidIsExecPidWrapper(t *testing.T) {
 		if pid != fakePid {
 			t.Errorf("openedPids contains %d, want only %d (trackedPid == execPid for in-place exec)", pid, fakePid)
 		}
+	}
+}
+
+// TestReattachContainerMappedLibsPidUsesExecPidForDiscovery proves that
+// ReattachContainerMappedLibsPid's execPid genuinely drives discovery
+// (/proc/<execPid>/maps), open (map_files keyed by execPid's mount
+// namespace), and the ELF arch-check (/proc/<execPid>/exe) -- not merely that
+// the code compiles with two separate pid parameters.
+//
+// containerPid=100 and execPid=200 are deliberately different pids, and only
+// execPid's synthetic /proc entries are populated (no /proc/100 at all): if a
+// future change accidentally scanned/opened by containerPid instead of
+// execPid, readProcMntns(containerPid) would fail against the synthetic
+// HostProcFs root (no such directory), discoverAndOpenMappedLibraries would
+// take its teardown-race early return, and the assertions below on
+// attachCount/containerPid2Inodes would fail. This is the mechanism that
+// actually discriminates a pid mix-up here -- NOT the ELF arch-check, whose
+// errors are non-fatal (discoverAndOpenMappedLibraries logs-and-continues
+// when elfMachineMatchesProcess itself errors, see mapfiles.go and
+// tracer.go's discoverAndOpenMappedLibraries).
+//
+// Bookkeeping (containerPid2Inodes, mappedLibAttached) is asserted to land on
+// containerPid, not execPid, per reattachMappedLibraries' documented
+// contract.
+//
+// host.HostProcFs is a process-global, so this test must not run with
+// t.Parallel(), and neither may any other test in this package that touches
+// host.HostProcFs.
+func TestReattachContainerMappedLibsPidUsesExecPidForDiscovery(t *testing.T) {
+	prevProcFs := host.HostProcFs
+	tmpDir := t.TempDir()
+	host.HostProcFs = tmpDir
+	t.Cleanup(func() { host.HostProcFs = prevProcFs })
+
+	selfExe, err := os.Readlink("/proc/self/exe")
+	if err != nil {
+		t.Skipf("cannot read own exe link: %v", err)
+	}
+
+	const containerPid = uint32(100)
+	const execPid = uint32(200)
+	const rangeKey = "7e8714023000-7e87141a3000"
+	pattern := regexp.MustCompile(`^libnetty.*\.so$`)
+
+	// Populate proc/<execPid>/{maps,ns/mnt,exe} under the synthetic root.
+	// Deliberately do NOT create anything under proc/<containerPid>, so a
+	// wrong-pid scan is detectable via these routings, not the arch-check.
+	execDir := filepath.Join(tmpDir, fmt.Sprint(execPid))
+	if err := os.MkdirAll(filepath.Join(execDir, "ns"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	mapsLine := buildMapsLine(rangeKey, "r-xp", 555, "/tmp/libnetty-openssl.so (deleted)")
+	if err := os.WriteFile(filepath.Join(execDir, "maps"), []byte(mapsLine+"\n"), 0o644); err != nil {
+		t.Fatalf("writing maps: %v", err)
+	}
+	if err := os.Symlink("mnt:[4026532999]", filepath.Join(execDir, "ns", "mnt")); err != nil {
+		t.Fatalf("symlinking ns/mnt: %v", err)
+	}
+	if err := os.Symlink(selfExe, filepath.Join(execDir, "exe")); err != nil {
+		t.Fatalf("symlinking exe: %v", err)
+	}
+
+	tr, st := newTestTracer(t)
+	tr.containerPid2Inodes[containerPid] = nil // seed bookkeeping for containerPid only
+	st.currentInode = 42424242
+
+	// Mock openMapFileFunc to hand back a real, openable ELF (this test binary)
+	// so elfMachineMatchesProcess's real ELF parse genuinely runs against
+	// execPid's /proc/<execPid>/exe, rather than short-circuiting on
+	// os.DevNull before the parse starts.
+	tr.openMapFileFunc = func(_ uint32, _ string, _ uint64) (*os.File, error) {
+		f, err := os.Open("/proc/self/exe")
+		if err != nil {
+			return nil, err
+		}
+		st.openFiles = append(st.openFiles, f)
+		return f, nil
+	}
+
+	if err := tr.ReattachContainerMappedLibsPid(containerPid, execPid, pattern); err != nil {
+		t.Fatalf("ReattachContainerMappedLibsPid: %v", err)
+	}
+
+	if st.attachCount != 1 {
+		t.Fatalf("attachCount = %d, want 1 (discovery/open/arch-check must have reached execPid's synthetic /proc entries)", st.attachCount)
+	}
+	if !tr.HasMappedLibForPid(containerPid) {
+		t.Errorf("HasMappedLibForPid(containerPid=%d) = false, want true", containerPid)
+	}
+	got := tr.containerPid2Inodes[containerPid]
+	if len(got) != 1 || got[0] != st.currentInode {
+		t.Errorf("containerPid2Inodes[containerPid=%d] = %v, want [%d] -- bookkeeping must stay on containerPid, not execPid", containerPid, got, st.currentInode)
+	}
+	if _, tracked := tr.containerPid2Inodes[execPid]; tracked {
+		t.Errorf("containerPid2Inodes must not gain a separate entry for execPid=%d", execPid)
 	}
 }

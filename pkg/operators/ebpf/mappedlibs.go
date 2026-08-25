@@ -53,9 +53,11 @@ import (
 const (
 	// mappedLibRetryAttempts is the maximum number of discovery passes per pid (N).
 	mappedLibRetryAttempts = 6
-	// mappedLibRetryWindow is the soft upper bound on the total retry duration (W);
-	// it is documentary — the actual schedule is mappedLibRetryBackoff, which sums
-	// to this value.
+	// mappedLibRetryWindow is the documentary envelope for the BACKOFF SCHEDULE's
+	// nominal sum specifically — it is NOT the retry ceiling. Since a re-arm can
+	// reset the attempt budget (see mappedLibTimerEntry.gen), the actual upper
+	// bound on one timer goroutine's lifetime is mappedLibRetryCeiling, which is
+	// deliberately longer than this value and IS enforced in code.
 	mappedLibRetryWindow = 30 * time.Second
 	// mappedLibRetryBackoffMin / Max bound the per-tick backoff (1s -> 5s).
 	mappedLibRetryBackoffMin = 1 * time.Second
@@ -70,6 +72,19 @@ const (
 // It is a package var so tests can shrink the delays without changing the
 // production schedule; production never reassigns it.
 var mappedLibBackoffSchedule = defaultMappedLibBackoffSchedule
+
+// mappedLibRetryCeiling is the hard wall-clock bound on a single retry
+// goroutine's lifetime. Because a re-arm resets the attempt budget
+// (mappedLibTimerEntry.gen), the attempt cap alone no longer bounds the
+// goroutine: an unbounded exec storm would otherwise keep refreshing the budget
+// forever. 3x the backoff schedule's nominal ~20s of waiting, leaving room for
+// a real exec storm to resolve while still terminating. Hitting the ceiling does
+// NOT wedge discovery for the container — the entry is removed, so the next
+// exec's arm() creates a fresh timer with a full budget.
+//
+// A package var (mirroring mappedLibBackoffSchedule) so tests can shrink it;
+// production never reassigns it.
+var mappedLibRetryCeiling = 60 * time.Second
 
 func defaultMappedLibBackoffSchedule() []time.Duration {
 	delays := make([]time.Duration, 0, mappedLibRetryAttempts-1)
@@ -198,56 +213,110 @@ func SetMappedLibPattern(pattern *regexp.Regexp) {
 	recompileMappedLibPatternLocked()
 }
 
-// mappedLibTimer is the per-pid retry-timer registry on the ebpfInstance. Its
-// mutex is dedicated (NOT i.mu, NOT any uprobe tracer's t.mu) so cancelling a
-// timer never contends with the attach path. cancel closes the stop channel;
-// wg tracks the live goroutines so Close can join them WITHOUT holding any t.mu.
+// mappedLibTimerEntry is one container's live retry timer. It is keyed in the
+// registry on containerPid (the cancellation identity), but carries execPid as a
+// MUTABLE scan target: a re-arm from a later exec updates the slot in place and
+// the running goroutine re-reads it on every pass, rather than the target being
+// frozen at arm time and a second exec's pid being silently discarded.
+//
+// Registry invariant: r.timers[cp] == e ⟹ exactly one live goroutine owns e. e
+// leaves the map only via cancel/cancelAll, or via that goroutine immediately
+// before it returns. A gen bump is guaranteed to be observed only on the retry
+// (cap-reached) path; the terminal paths — success, detach (<-stop), shutdown
+// (<-i.done), ceiling — drop a racing bump deliberately, which is safe because
+// removal-then-return leaves the next arm() free to create a fresh entry rather
+// than dedup against a dead one. (This clause concerns the generation/
+// budget-reset signal only, not the mutable scan target — the re-armed
+// e.execPid is re-read by the running goroutine on every pass regardless of
+// gen; only the retry-budget-reset signal is disposition-gated as described
+// here.) Every exit path in armMappedLibTimer is derived from this invariant,
+// not patched independently.
+type mappedLibTimerEntry struct {
+	stop    chan struct{}
+	execPid atomic.Uint32 // latest exec'd pid to scan; updated in place on re-arm
+	gen     atomic.Uint64 // bumped on every re-arm; see rearmedOrRetire
+}
+
+// mappedLibTimer is the per-containerPid retry-timer registry on the
+// ebpfInstance. Its mutex is dedicated (NOT i.mu, NOT any uprobe tracer's t.mu)
+// so cancelling a timer never contends with the attach path. cancel closes the
+// stop channel; wg tracks the live goroutines so Close can join them WITHOUT
+// holding any t.mu.
 type mappedLibTimerRegistry struct {
 	mu     sync.Mutex
-	timers map[uint32]chan struct{} // pid -> stop channel
+	timers map[uint32]*mappedLibTimerEntry // containerPid -> live timer
 	wg     sync.WaitGroup
 }
 
 func newMappedLibTimerRegistry() *mappedLibTimerRegistry {
-	return &mappedLibTimerRegistry{timers: make(map[uint32]chan struct{})}
+	return &mappedLibTimerRegistry{timers: make(map[uint32]*mappedLibTimerEntry)}
 }
 
-// arm starts a retry goroutine for pid unless one is already armed (dedup). It
-// returns the stop channel, or nil if the pid was already armed. The caller runs
-// the goroutine body.
-func (r *mappedLibTimerRegistry) arm(pid uint32) (chan struct{}, bool) {
+// arm starts a retry goroutine for containerPid unless one is already armed
+// (dedup). It returns the new entry, or nil if one already existed — in which
+// case the existing entry's scan target is refreshed to execPid and its
+// generation bumped, so the already-running goroutine picks up the newer exec
+// instead of the re-arm being dropped. The caller runs the goroutine body.
+func (r *mappedLibTimerRegistry) arm(containerPid, execPid uint32) (*mappedLibTimerEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.timers[pid]; exists {
+	if existing, exists := r.timers[containerPid]; exists {
+		existing.execPid.Store(execPid)
+		existing.gen.Add(1)
 		return nil, false
 	}
-	stop := make(chan struct{})
-	r.timers[pid] = stop
+	entry := &mappedLibTimerEntry{stop: make(chan struct{})}
+	entry.execPid.Store(execPid)
+	r.timers[containerPid] = entry
 	r.wg.Add(1)
-	return stop, true
+	return entry, true
 }
 
-// deregister removes a pid's timer from the registry without closing the stop
-// channel (the goroutine deregisters itself when it exits naturally). Idempotent.
-func (r *mappedLibTimerRegistry) deregister(pid uint32) {
+// retire removes e from the registry unconditionally, identity-checked so a
+// newer entry installed by a concurrent arm() is never clobbered. Idempotent.
+// Called by the success, shutdown, and ceiling paths. NOT called by the detach
+// (<-stop) path, since cancel() already removed the entry before closing stop;
+// NOT called by the cap-reached (retry) path, which uses rearmedOrRetire
+// instead.
+func (r *mappedLibTimerRegistry) retire(cp uint32, e *mappedLibTimerEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.timers, pid)
+	if r.timers[cp] == e {
+		delete(r.timers, cp)
+	}
 }
 
-// cancel closes a pid's stop channel (signalling its goroutine to exit) and
-// removes it from the registry. Idempotent: a pid whose goroutine already exited
-// is a no-op. It does NOT wait for the goroutine — that join is the registry
-// WaitGroup's job (cancelAll), which must run without any t.mu held.
-func (r *mappedLibTimerRegistry) cancel(pid uint32) {
+// rearmedOrRetire is used ONLY by the cap-reached path, which is the one exit
+// path that may legitimately keep going instead of exiting. If a re-arm landed
+// (gen != lastGen), the entry is NOT deleted and the caller must continue with
+// the new generation. Otherwise this behaves exactly like retire. The gen check
+// and the delete happen inside ONE lock hold, so a re-arm landing in the exit
+// window cannot be lost between them.
+func (r *mappedLibTimerRegistry) rearmedOrRetire(cp uint32, e *mappedLibTimerEntry, lastGen uint64) (newGen uint64, keepGoing bool) {
 	r.mu.Lock()
-	stop, exists := r.timers[pid]
+	defer r.mu.Unlock()
+	if g := e.gen.Load(); g != lastGen {
+		return g, true // a re-arm landed; caller adopts the new generation and keeps going
+	}
+	if r.timers[cp] == e {
+		delete(r.timers, cp)
+	}
+	return lastGen, false
+}
+
+// cancel closes a containerPid's stop channel (signalling its goroutine to exit)
+// and removes it from the registry. Idempotent: a pid whose goroutine already
+// exited is a no-op. It does NOT wait for the goroutine — that join is the
+// registry WaitGroup's job (cancelAll), which must run without any t.mu held.
+func (r *mappedLibTimerRegistry) cancel(containerPid uint32) {
+	r.mu.Lock()
+	entry, exists := r.timers[containerPid]
 	if exists {
-		delete(r.timers, pid)
+		delete(r.timers, containerPid)
 	}
 	r.mu.Unlock()
 	if exists {
-		close(stop)
+		close(entry.stop)
 	}
 }
 
@@ -256,31 +325,40 @@ func (r *mappedLibTimerRegistry) cancel(pid uint32) {
 // goroutines acquire t.mu transiently. Used by ebpfInstance.Close.
 func (r *mappedLibTimerRegistry) cancelAll() {
 	r.mu.Lock()
-	for pid, stop := range r.timers {
-		delete(r.timers, pid)
-		close(stop)
+	for containerPid, entry := range r.timers {
+		delete(r.timers, containerPid)
+		close(entry.stop)
 	}
 	r.mu.Unlock()
 	r.wg.Wait()
 }
 
-// armMappedLibTimer arms (once per pid) a bounded retry goroutine that fans out
-// ReattachContainerMappedLibsPid across i.uprobeTracers until any tracer reports
-// the library attached for that pid (HasMappedLibForPid) or the attempt cap is
-// hit, then deregisters. It is a no-op when the feature is off (nil pattern).
+// armMappedLibTimer arms (once per containerPid) a bounded retry goroutine that
+// fans out ReattachContainerMappedLibsPid across i.uprobeTracers until any
+// tracer reports the library attached for that container (HasMappedLibForPid),
+// the attempt cap is hit, or the wall-clock ceiling expires. It is a no-op when
+// the feature is off (nil pattern).
+//
+// containerPid is the dedup/cancellation key; execPid is the pid whose procfs
+// the pass actually scans. A re-arm with a later execPid does not start a second
+// goroutine — it updates the live entry's scan target and resets the running
+// goroutine's attempt budget, so an exec storm cannot exhaust the budget on
+// early short-lived execs before the real target settles.
 //
 // Lock order: the goroutine takes a uprobe tracer's t.mu only transiently inside
 // the public Tracer methods. It NEVER holds t.mu across the stop-channel select.
 // Cancellation (DetachContainer/Close) closes stop and joins via the registry
 // WaitGroup, never under t.mu.
-func (i *ebpfInstance) armMappedLibTimer(pid uint32) {
+func (i *ebpfInstance) armMappedLibTimer(containerPid, execPid uint32) {
 	pattern := i.mappedLibPattern
 	if pattern == nil {
 		return
 	}
-	stop, armed := i.mappedLibTimers.arm(pid)
+	entry, armed := i.mappedLibTimers.arm(containerPid, execPid)
 	if !armed {
-		// Already armed for this pid (a duplicate exec/reattach): do not double-arm.
+		// Already armed for this container (a duplicate exec/reattach): do not
+		// double-arm. arm() has refreshed the existing entry's scan target and
+		// bumped its generation, so the running goroutine picks up this exec.
 		return
 	}
 
@@ -293,45 +371,77 @@ func (i *ebpfInstance) armMappedLibTimer(pid uint32) {
 
 	go func() {
 		defer i.mappedLibTimers.wg.Done()
-		defer i.mappedLibTimers.deregister(pid)
 
-		schedule := mappedLibBackoffSchedule()
+		schedule := mappedLibBackoffSchedule() // len(schedule) >= 1 for both the production schedule and test overrides
+		// delayIdx is deliberately decoupled from attempt and monotonically
+		// non-decreasing: a re-arm refreshes the retry budget (attempt) without
+		// rewinding backoff progression, so an exec storm cannot pin the poll
+		// rate to the schedule's floor for its whole duration. Its explicit
+		// clamp below is also what keeps schedule[delayIdx] in range now that
+		// attempt can be reset — do NOT reintroduce an `attempt >= len(schedule)`
+		// break guard, which has no re-arm-aware equivalent and would silently
+		// break the reset-and-continue path. The other half of that guard's old
+		// job is done by the cap-reached check returning or continuing BEFORE the
+		// select that would have indexed the schedule.
+		delayIdx, lastGen, start := 0, entry.gen.Load(), time.Now()
 		for attempt := 0; attempt < mappedLibRetryAttempts; attempt++ {
-			// Fan out a discovery+attach pass for pids still lacking the lib.
-			attached := pass(pid, pattern)
-			if attached {
-				i.logger.Debugf("ebpf: mapped-lib retry timer for pid %d: attached on attempt %d", pid, attempt+1)
+			if time.Since(start) >= mappedLibRetryCeiling {
+				i.mappedLibTimers.retire(containerPid, entry) // path 5: wall-clock ceiling
 				return
 			}
-			if attempt >= len(schedule) {
-				break
+			// Fan out a discovery+attach pass, re-reading the scan target so a
+			// re-arm that landed since the last pass is picked up.
+			if pass(containerPid, entry.execPid.Load(), pattern) {
+				// "attempt %d" is relative to the CURRENT generation: after a
+				// budget reset a later pass can log a low attempt number.
+				i.logger.Debugf("ebpf: mapped-lib retry timer for pid %d: attached on attempt %d", containerPid, attempt+1)
+				i.mappedLibTimers.retire(containerPid, entry) // path 1: success
+				return
+			}
+			if attempt+1 >= mappedLibRetryAttempts { // path 4: cap reached
+				if g, keep := i.mappedLibTimers.rearmedOrRetire(containerPid, entry, lastGen); keep {
+					lastGen, attempt = g, -1
+					continue
+				}
+				i.logger.Debugf("ebpf: mapped-lib retry timer for pid %d: cap reached (%d attempts), giving up", containerPid, mappedLibRetryAttempts)
+				return
 			}
 			select {
-			case <-stop:
-				return
+			case <-entry.stop:
+				return // path 2: detached — cancel() already removed the entry
 			case <-i.done:
+				i.mappedLibTimers.retire(containerPid, entry) // path 3: agent shutdown
 				return
-			case <-time.After(schedule[attempt]):
+			case <-time.After(schedule[delayIdx]):
+				if delayIdx < len(schedule)-1 {
+					delayIdx++
+				}
 			}
 		}
-		i.logger.Debugf("ebpf: mapped-lib retry timer for pid %d: cap reached (%d attempts), giving up", pid, mappedLibRetryAttempts)
+		// Unreachable today: every loop exit above is an explicit return, and
+		// mappedLibRetryAttempts is a positive const so the loop condition itself
+		// never falls through. This is a defensive backstop only for a future
+		// change that turns mappedLibRetryAttempts into a var (or 0), so a
+		// fall-through can never leak this entry out of the registry.
+		i.mappedLibTimers.retire(containerPid, entry)
 	}()
 }
 
 // runMappedLibPass runs one discovery+attach pass across all uprobe tracers for
-// pid and reports whether the targeted library is now attached on any tracer.
-// Re-scan is scoped to tracers that do NOT yet report the lib for this pid.
-func (i *ebpfInstance) runMappedLibPass(pid uint32, pattern *regexp.Regexp) bool {
+// containerPid, scanning execPid's procfs, and reports whether the targeted
+// library is now attached on any tracer. Re-scan is scoped to tracers that do
+// NOT yet report the lib for this container.
+func (i *ebpfInstance) runMappedLibPass(containerPid, execPid uint32, pattern *regexp.Regexp) bool {
 	anyAttached := false
 	for _, handler := range i.uprobeTracers {
-		if handler.HasMappedLibForPid(pid) {
+		if handler.HasMappedLibForPid(containerPid) {
 			anyAttached = true
 			continue
 		}
-		if err := handler.ReattachContainerMappedLibsPid(pid, pattern); err != nil {
-			i.logger.Debugf("ebpf: mapped-lib reattach for pid %d: %v", pid, err)
+		if err := handler.ReattachContainerMappedLibsPid(containerPid, execPid, pattern); err != nil {
+			i.logger.Debugf("ebpf: mapped-lib reattach for containerPid %d execPid %d: %v", containerPid, execPid, err)
 		}
-		if handler.HasMappedLibForPid(pid) {
+		if handler.HasMappedLibForPid(containerPid) {
 			anyAttached = true
 		}
 	}
