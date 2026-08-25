@@ -1205,8 +1205,11 @@ func (t *Tracer[Event]) ReattachContainerExecPid(containerPid, execPid uint32) e
 //   - Pattern is CALLER-SUPPLIED: the tcnative regex lives in the caller
 //     (node-agent / Phase-3 wiring), not here.
 //
+// containerPid keys all bookkeeping (tracked-pid guard, commit); execPid is the
+// pid actually scanned/opened — see discoverAndOpenMappedLibraries.
+//
 // Caller holds t.mu.
-func (t *Tracer[Event]) reattachMappedLibraries(containerPid uint32, pattern *regexp.Regexp) error {
+func (t *Tracer[Event]) reattachMappedLibraries(containerPid, execPid uint32, pattern *regexp.Regexp) error {
 	if t.closed {
 		return errors.New("uprobetracer has been closed")
 	}
@@ -1226,7 +1229,7 @@ func (t *Tracer[Event]) reattachMappedLibraries(containerPid uint32, pattern *re
 	// Discover + open under the held lock here (this is the test/integration entry
 	// point; lock-hold time is irrelevant). The production path
 	// (ReattachContainerMappedLibsPid) runs the same discovery OFF the lock.
-	opened, err := t.discoverAndOpenMappedLibraries(containerPid, pattern)
+	opened, err := t.discoverAndOpenMappedLibraries(containerPid, execPid, pattern)
 	if err != nil {
 		closeMappedOpen(opened) // empty today (error precedes the open loop); defensive against future partial-result edits
 		return err
@@ -1257,46 +1260,59 @@ type mappedOpen struct {
 // candidates; the caller commits them (commitMappedLibraries) or releases them
 // (closeMappedOpen) on bail. A complete discovery failure is returned as an error;
 // a teardown race (pid gone) returns (nil, nil).
-func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid uint32, pattern *regexp.Regexp) ([]mappedOpen, error) {
+//
+// Every procfs read here uses execPid, NOT containerPid: /proc/<pid>/maps and
+// /proc/<pid>/map_files/<range> are pid-specific, and for a container whose
+// tracked entrypoint forks the real workload (a `kubectl exec` child, a wrapper
+// loop), containerPid's own address space never maps the target library. Only
+// the pid that actually executed can reveal it. Bookkeeping (the commit,
+// containerPid2Inodes, mappedLibAttached) stays credited to containerPid.
+func (t *Tracer[Event]) discoverAndOpenMappedLibraries(containerPid, execPid uint32, pattern *regexp.Regexp) ([]mappedOpen, error) {
 	// Capture the mount namespace BEFORE walking maps so we can pass it to
 	// openMapFile for the post-open PID-recycle validation.
-	expectedMntns, err := readProcMntns(containerPid)
+	expectedMntns, err := readProcMntns(execPid)
 	if err != nil {
 		// PID already gone: not an error, just a teardown race.
-		t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d: mntns read failed (pid gone?): %v", containerPid, err)
+		t.logger.Debugf("uprobetracer: reattachMappedLibraries containerPid=%d execPid=%d: mntns read failed (pid gone?): %v", containerPid, execPid, err)
 		return nil, nil
 	}
 
-	libs, err := discoverMappedLibraries(containerPid, pattern)
+	libs, err := discoverMappedLibraries(execPid, pattern)
 	if err != nil {
-		return nil, fmt.Errorf("discovering mapped libraries for pid %d: %w", containerPid, err)
+		return nil, fmt.Errorf("discovering mapped libraries for containerPid %d execPid %d: %w", containerPid, execPid, err)
 	}
 	paths := make([]string, 0, len(libs))
 	for _, lib := range libs {
 		paths = append(paths, lib.path)
 	}
-	t.logger.Debugf("uprobetracer: discoverAndOpenMappedLibraries: matched=%d pid=%d paths=%v", len(libs), containerPid, paths)
+	t.logger.Debugf("uprobetracer: discoverAndOpenMappedLibraries: matched=%d containerPid=%d execPid=%d paths=%v", len(libs), containerPid, execPid, paths)
 
 	var opened []mappedOpen
 	for _, lib := range libs {
-		file, err := t.openMapFileFunc(containerPid, lib.rangeKey, expectedMntns)
+		file, err := t.openMapFileFunc(execPid, lib.rangeKey, expectedMntns)
 		if err != nil {
 			// EACCES/EPERM/ENOENT / mntns mismatch / PID race: log and skip.
-			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: open failed: %v", containerPid, lib.path, err)
+			t.logger.Debugf("uprobetracer: reattachMappedLibraries containerPid=%d execPid=%d %q: open failed: %v", containerPid, execPid, lib.path, err)
 			continue
 		}
 
 		// Arch guard: skip .so files whose ELF e_machine does not match the
 		// container process. Non-fatal if the check itself fails (e.g. the
 		// process exe is gone): still try to attach (worst case: symbol absent).
-		if matches, err := elfMachineMatchesProcess(file, containerPid); err != nil {
-			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: arch check failed: %v", containerPid, lib.path, err)
+		if matches, err := elfMachineMatchesProcess(file, execPid); err != nil {
+			t.logger.Debugf("uprobetracer: reattachMappedLibraries containerPid=%d execPid=%d %q: arch check failed: %v", containerPid, execPid, lib.path, err)
 		} else if !matches {
-			t.logger.Debugf("uprobetracer: reattachMappedLibraries pid %d %q: ELF e_machine mismatch, skipping", containerPid, lib.path)
+			t.logger.Debugf("uprobetracer: reattachMappedLibraries containerPid=%d execPid=%d %q: ELF e_machine mismatch, skipping", containerPid, execPid, lib.path)
 			file.Close()
 			continue
 		}
 
+		// resolveAttachOffsets deliberately keeps containerPid: its pid argument is
+		// carried for diagnostics only, never as an event-join key (resolver.go:63-64),
+		// and it short-circuits to nil before any ELF parse when the tracer has no
+		// attachOffsetsResolver (resolver.go:161-164). Passing execPid here would
+		// change only log/error text, and would make those diagnostics disagree with
+		// every other pid field on this attach.
 		opened = append(opened, mappedOpen{file: file, path: lib.path, rangeKey: lib.rangeKey, offsets: t.resolveAttachOffsets(file, containerPid)})
 	}
 	return opened, nil
@@ -1352,7 +1368,12 @@ func (t *Tracer[Event]) commitMappedLibraries(containerPid uint32, opened []mapp
 // It is driven by the Phase-3 fork-internal retry timer (ebpfInstance.ReattachContainer)
 // and is safe to call repeatedly: it is idempotent via the union-with-delta
 // existing-set seeding inside reattachMappedLibraries.
-func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid uint32, pattern *regexp.Regexp) error {
+//
+// containerPid is the cancellation/bookkeeping identity (tracked-pid guard,
+// commit, refcounting); execPid is the pid whose procfs is actually scanned and
+// opened. They are equal for a container whose tracked process is the workload,
+// and diverge whenever the workload runs as a forked child.
+func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid, execPid uint32, pattern *regexp.Regexp) error {
 	if pattern == nil {
 		return nil
 	}
@@ -1376,7 +1397,7 @@ func (t *Tracer[Event]) ReattachContainerMappedLibsPid(containerPid uint32, patt
 	t.mu.Unlock()
 
 	// Phase 1 (NO lock): discover + open the map_files candidates.
-	opened, err := t.discoverAndOpenMappedLibraries(containerPid, pattern)
+	opened, err := t.discoverAndOpenMappedLibraries(containerPid, execPid, pattern)
 	if err != nil {
 		closeMappedOpen(opened) // empty today (error precedes the open loop); defensive against future partial-result edits
 		return err

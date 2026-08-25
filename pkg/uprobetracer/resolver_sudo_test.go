@@ -132,7 +132,7 @@ func TestMapFilesResolvesOffset(t *testing.T) {
 	})
 
 	self := uint32(os.Getpid())
-	opened, err := tr.discoverAndOpenMappedLibraries(self, regexp.MustCompile(`^libc\.so`))
+	opened, err := tr.discoverAndOpenMappedLibraries(self, self, regexp.MustCompile(`^libc\.so`))
 	if err != nil {
 		t.Fatalf("discoverAndOpenMappedLibraries: %v", err)
 	}
