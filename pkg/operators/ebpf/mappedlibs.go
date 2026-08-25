@@ -530,6 +530,16 @@ func (i *ebpfInstance) armMappedLibTimer(containerPid, execPid uint32) {
 	}()
 }
 
+// mappedLibHandler is the narrow view of *uprobetracer.Tracer[T] that
+// fanOutMappedLibPass needs. Extracting it lets the per-handler-fairness
+// fan-out logic below be unit-tested with lightweight fakes instead of a real
+// eBPF tracer (i.uprobeTracers's element type carries a live eBPF program and
+// cannot be constructed cheaply in a table test).
+type mappedLibHandler interface {
+	HasMappedLibForPid(containerPid uint32) bool
+	ReattachContainerMappedLibsPid(containerPid, execPid uint32, pattern *regexp.Regexp) error
+}
+
 // runMappedLibPass runs one discovery+attach pass across all uprobe tracers for
 // containerPid, scanning each of execPids' procfs, and reports whether the
 // targeted library is now attached on any tracer, alongside any candidates a
@@ -558,32 +568,60 @@ func (i *ebpfInstance) runMappedLibPass(containerPid uint32, execPids []uint32, 
 			deadPids = append(deadPids, execPid)
 		}
 	}
-	for _, handler := range i.uprobeTracers {
+
+	handlers := make(map[string]mappedLibHandler, len(i.uprobeTracers))
+	for name, h := range i.uprobeTracers {
+		handlers[name] = h
+	}
+	anyAttached = fanOutMappedLibPass(handlers, containerPid, live, pattern, deadline, func(execPid uint32, err error) {
+		i.logger.Debugf("ebpf: mapped-lib reattach for containerPid %d execPid %d: %v", containerPid, execPid, err)
+	})
+	return anyAttached, deadPids
+}
+
+// fanOutMappedLibPass calls ReattachContainerMappedLibsPid on every handler not
+// yet satisfied (HasMappedLibForPid), scanning live execPids for each in turn.
+//
+// deadline bounds how long a single handler's OWN execPid scan may run past
+// it -- NOT the whole fan-out. A resolver-backed handler (e.g. AEAD's, whose
+// ReattachContainerMappedLibsPid triggers a multi-hundred-MiB ELF scan per
+// candidate) can legitimately blow through the shared deadline on its own
+// scan; when it does, only ITS remaining execPid candidates are skipped
+// (`break` out of the inner loop), and the outer loop moves on to the next
+// handler, which still gets its own first attempt. Aborting the whole pass on
+// the first overrun (an earlier version of this function did `return` instead
+// of `break` here) meant Go's randomized map iteration order could starve
+// out an entire class of handlers indefinitely: whichever handlers land after
+// the first slow one in a given pass's iteration order get ZERO attempts, and
+// since a starved handler's HasMappedLibForPid never turns true, it starves on
+// every subsequent pass too -- not a one-time slow pass, a permanent miss.
+// This surfaced live: Copilot CLI's runtime.node was correctly discovered and
+// opened via map_files, but the AEAD uprobe handlers (aead_gcm_decrypt_ctr32,
+// aead_chacha20_open, aead_gcm_decrypt_stitched, ...) never appeared in a
+// single discoverAndOpenMappedLibraries/commitMappedLibraries log line against
+// it -- only the cheap, non-resolver-backed gotls handlers ever got a turn.
+//
+// The overrun check runs AFTER ReattachContainerMappedLibsPid returns, so it
+// cannot preempt an in-flight call -- it bounds a handler's own overshoot to
+// AT MOST ONE such call, not chain unboundedly many of them for that handler.
+func fanOutMappedLibPass(handlers map[string]mappedLibHandler, containerPid uint32, live []uint32, pattern *regexp.Regexp, deadline time.Time, onReattachErr func(execPid uint32, err error)) (anyAttached bool) {
+	for _, handler := range handlers {
 		if handler.HasMappedLibForPid(containerPid) {
 			anyAttached = true
 			continue
 		}
 		for _, execPid := range live {
 			if err := handler.ReattachContainerMappedLibsPid(containerPid, execPid, pattern); err != nil {
-				i.logger.Debugf("ebpf: mapped-lib reattach for containerPid %d execPid %d: %v", containerPid, execPid, err)
+				onReattachErr(execPid, err)
 			}
 			if handler.HasMappedLibForPid(containerPid) {
 				anyAttached = true
 				break // this handler is satisfied; stop scanning further candidates FOR IT
 			}
 			if time.Now().After(deadline) {
-				// A matching-but-uncommitted candidate can trigger a full ELF/AEAD-resolver
-				// scan per call (tracer.go's resolveAttachOffsets). This check runs AFTER
-				// ReattachContainerMappedLibsPid returns, so it cannot preempt an in-flight call
-				// -- it bounds overshoot past the ceiling to AT MOST ONE such call (up to ~5.6s),
-				// rather than letting a pass chain unboundedly many of them, and rather than
-				// relying solely on the top-of-loop check that only fires BETWEEN passes. This
-				// condition pre-exists at 1x today (a single non-committing candidate can already
-				// loop here indefinitely); this plan's multi-candidate scanning is what makes
-				// bounding it within a pass necessary rather than merely theoretical.
-				return anyAttached, deadPids
+				break // this handler's budget is spent; move to the NEXT HANDLER so it still gets its own first attempt (see func doc)
 			}
 		}
 	}
-	return anyAttached, deadPids
+	return anyAttached
 }

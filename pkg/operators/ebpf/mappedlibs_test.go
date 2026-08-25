@@ -789,3 +789,94 @@ func TestAddMappedLibPattern_EmptyAfterClear(t *testing.T) {
 // in this file cleans up via SetMappedLibPattern(nil), so a fresh run (or any
 // run following cleanup) starts from mappedLibPatternGlobal == nil, matching
 // today's unchanged zero-value behavior.
+
+// fakeMappedLibHandler is a lightweight mappedLibHandler double: no eBPF, no
+// procfs, just a call counter and a togglable "already attached" flag.
+type fakeMappedLibHandler struct {
+	mu           sync.Mutex
+	calls        int
+	hasMappedLib bool
+}
+
+func (f *fakeMappedLibHandler) HasMappedLibForPid(uint32) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hasMappedLib
+}
+
+func (f *fakeMappedLibHandler) ReattachContainerMappedLibsPid(uint32, uint32, *regexp.Regexp) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return nil
+}
+
+// TestFanOutMappedLibPassGivesEveryHandlerAnAttemptOnDeadlineOverrun is the
+// regression test for the AEAD-starvation bug: a resolver-backed handler (in
+// production, AEAD's ELF-scanning ReattachContainerMappedLibsPid) that runs
+// long enough to blow the shared deadline must not deny every OTHER handler
+// their own first attempt for the pass. Before the fix, fanOutMappedLibPass's
+// predecessor `return`ed on the FIRST deadline overrun encountered while
+// iterating handlers in Go's randomized map order — so whichever handlers a
+// given pass's iteration order happened to place after the slow one got ZERO
+// calls, deterministically forever (a starved handler's HasMappedLibForPid
+// never flips true, so it starves on every subsequent pass too).
+//
+// The deadline here is already elapsed before fanOutMappedLibPass is even
+// called, so EVERY handler's first ReattachContainerMappedLibsPid call runs
+// past it — this exercises the overrun path for all N handlers in one
+// deterministic pass, independent of map iteration order.
+func TestFanOutMappedLibPassGivesEveryHandlerAnAttemptOnDeadlineOverrun(t *testing.T) {
+	const numHandlers = 8
+	handlers := make(map[string]mappedLibHandler, numHandlers)
+	fakes := make(map[string]*fakeMappedLibHandler, numHandlers)
+	for i := 0; i < numHandlers; i++ {
+		name := "handler-" + strconv.Itoa(i)
+		f := &fakeMappedLibHandler{}
+		fakes[name] = f
+		handlers[name] = f
+	}
+
+	deadline := time.Now().Add(-time.Hour) // already elapsed
+	live := []uint32{1234}
+
+	anyAttached := fanOutMappedLibPass(handlers, 999, live, nil, deadline, func(uint32, error) {})
+	if anyAttached {
+		t.Fatalf("anyAttached = true, want false (no fake ever reports HasMappedLibForPid)")
+	}
+
+	for name, f := range fakes {
+		f.mu.Lock()
+		calls := f.calls
+		f.mu.Unlock()
+		if calls != 1 {
+			t.Errorf("%s: ReattachContainerMappedLibsPid calls = %d, want exactly 1 (every handler must get at least one attempt even after the shared deadline has already elapsed)", name, calls)
+		}
+	}
+}
+
+// TestFanOutMappedLibPassSkipsAlreadySatisfiedHandlers confirms a handler that
+// already reports HasMappedLibForPid==true is never called and still counts
+// toward anyAttached, regardless of deadline state.
+func TestFanOutMappedLibPassSkipsAlreadySatisfiedHandlers(t *testing.T) {
+	satisfied := &fakeMappedLibHandler{hasMappedLib: true}
+	pending := &fakeMappedLibHandler{}
+	handlers := map[string]mappedLibHandler{"satisfied": satisfied, "pending": pending}
+
+	anyAttached := fanOutMappedLibPass(handlers, 999, []uint32{1234}, nil, time.Now().Add(time.Hour), func(uint32, error) {})
+	if !anyAttached {
+		t.Fatalf("anyAttached = false, want true (satisfied handler already reports the lib attached)")
+	}
+	satisfied.mu.Lock()
+	satisfiedCalls := satisfied.calls
+	satisfied.mu.Unlock()
+	if satisfiedCalls != 0 {
+		t.Errorf("satisfied handler got %d ReattachContainerMappedLibsPid calls, want 0 (already-attached handlers must be skipped, not re-scanned)", satisfiedCalls)
+	}
+	pending.mu.Lock()
+	pendingCalls := pending.calls
+	pending.mu.Unlock()
+	if pendingCalls != 1 {
+		t.Errorf("pending handler got %d calls, want 1", pendingCalls)
+	}
+}
