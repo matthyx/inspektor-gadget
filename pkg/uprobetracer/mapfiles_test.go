@@ -127,6 +127,43 @@ func TestParseMappedLibraries(t *testing.T) {
 	}
 }
 
+// TestMapFilesUnionPattern proves, end to end through the real
+// parseMappedLibraries gate (not one layer up in a unit test of the pattern
+// store alone), that a two-alternative anchored union regex — the same shape
+// ebpfoperator.AddMappedLibPattern compiles ("(?:src1)|(?:src2)") — selects
+// basenames matching EITHER alternative and rejects one matching neither. A
+// top-level function (not folded into TestParseMappedLibraries's table) so it
+// has an independently addressable name for `go test -run`.
+func TestMapFilesUnionPattern(t *testing.T) {
+	union := regexp.MustCompile(`(?:^a\.so$)|(?:^b\.node$)`)
+	maps := strings.Join([]string{
+		"7e8714023000-7e87141a3000 r-xp 00023000 00:2e 1000001   /tmp/a.so",
+		"7e8714100000-7e8714200000 r-xp 00000000 00:2e 1000002   /tmp/b.node",
+		"7e8714300000-7e8714400000 r-xp 00000000 00:2e 1000003   /tmp/c.txt",
+	}, "\n")
+
+	libs, err := parseMappedLibraries(strings.NewReader(maps), union)
+	if err != nil {
+		t.Fatalf("parseMappedLibraries returned error: %v", err)
+	}
+	if len(libs) != 2 {
+		t.Fatalf("got %d libs, want 2 (a.so and b.node; c.txt must be rejected): %+v", len(libs), libs)
+	}
+	gotInodes := map[uint64]bool{}
+	for _, lib := range libs {
+		gotInodes[lib.inode] = true
+	}
+	if !gotInodes[1000001] {
+		t.Errorf("a.so (inode 1000001, matches first alternative) not selected")
+	}
+	if !gotInodes[1000002] {
+		t.Errorf("b.node (inode 1000002, matches second alternative) not selected")
+	}
+	if gotInodes[1000003] {
+		t.Errorf("c.txt (inode 1000003, matches neither alternative) was incorrectly selected")
+	}
+}
+
 func TestMapFilesParseInode(t *testing.T) {
 	tests := []struct {
 		field string

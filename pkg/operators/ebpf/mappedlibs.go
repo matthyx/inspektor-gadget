@@ -40,6 +40,7 @@ package ebpfoperator
 
 import (
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,12 +86,13 @@ func defaultMappedLibBackoffSchedule() []time.Duration {
 	return delays
 }
 
-// mappedLibPatternGlobal is the package-global tcnative (or other) basename
-// matcher, set by node-agent via SetMappedLibPattern before any gadget is
-// instantiated — exactly as node-agent calls container-hook.SetExecEventsCollection.
-// A nil value (the default) means the feature is OFF. It is read once per
-// ebpfInstance in newInstance into i.mappedLibPattern; the atomic pointer keeps
-// the setter race-free relative to instance construction.
+// mappedLibPatternGlobal is the package-global tcnative-or-other basename
+// matcher, set by node-agent via SetMappedLibPattern/AddMappedLibPattern before
+// any gadget is instantiated — exactly as node-agent calls
+// container-hook.SetExecEventsCollection. A nil value (the default) means the
+// feature is OFF. It is read once per ebpfInstance in newInstance into
+// i.mappedLibPattern; the atomic pointer keeps the setter race-free relative to
+// instance construction.
 //
 // SEAM DECISION (flagged for architect): the plan's preferred seam was a config
 // setter propagated from localmanager/kubemanager down to ebpfInstance. That path
@@ -100,14 +102,98 @@ func defaultMappedLibBackoffSchedule() []time.Duration {
 // setter is the EXISTING, proven precedent in this very re-attach chain
 // (container-hook.SetExecEventsCollection), keeps the matcher node-agent-supplied
 // (Principle 5), and defaults OFF (nil) for zero behaviour change.
+//
+// ADDITIVE REGISTRATION (union-regex synthesis): multiple node-agent-side callers
+// (netty-tcnative, AEAD runtime.node, ...) each own a distinct basename pattern
+// and must be able to register theirs without clobbering the others — the
+// original single-pattern, last-writer-wins Store() made that impossible.
+// mappedLibPatternSources holds each registered pattern's original source string
+// (regexp.Regexp.String() — preserves anchors/flags exactly); every mutation
+// recompiles their union ("(?:src1)|(?:src2)|...") and atomically republishes it
+// into this SAME atomic.Pointer[regexp.Regexp]. This keeps every downstream
+// reader (ebpf.go's Load(), mapfiles.go's MatchString, tracer.go's nil-gate)
+// completely unaware that multiple source patterns exist — no type change, no
+// second exported-signature break. Go's ^/$ are start/end-of-TEXT (not per-line)
+// absent (?m), so per-alternative anchoring composes correctly across the join.
+// Invariant: mappedLibPatternGlobal always holds either nil or a fully-formed,
+// immutable, already-compiled regex — a reader never observes a
+// partially-updated state, and len(sources)==0 always stores nil directly
+// (never compiles+stores the empty-join "(?:)" ,  which would match every
+// string).
+//
+// KNOWN LIMITATION (mappedLibAttached coverage, see uprobetracer/tracer.go's
+// mappedLibAttached/HasMappedLibForPid): with N>1 registered patterns,
+// "attached" means "at least one of N matched" — the Phase-3 retry loop
+// (armMappedLibTimer) can stop for a pid once ANY registered pattern's library
+// is discovered, before a SECOND, later-mapped library (matching a different
+// registered pattern) is ever found. Unreachable today: netty-tcnative targets
+// the JVM and the AEAD runtime.node pattern targets Node.js — disjoint runtimes,
+// never co-mapped in the same container. Revisit if a third pattern is added, or
+// if two registered patterns can ever match within the same container.
+var mappedLibPatternMu sync.Mutex
+var mappedLibPatternSources []string
 var mappedLibPatternGlobal atomic.Pointer[regexp.Regexp]
 
+// recompileMappedLibPatternLocked rebuilds the union regex from
+// mappedLibPatternSources and republishes it. Caller must hold
+// mappedLibPatternMu. An empty source list always stores nil directly — it never
+// compiles the empty join "(?:)", which would match every string. A compile
+// error (not expected for sources drawn from already-valid *regexp.Regexp
+// values, but handled defensively since this package has no logger dependency
+// to report through) leaves the previously-published pattern in place and does
+// not update sources with the offending value.
+func recompileMappedLibPatternLocked() {
+	if len(mappedLibPatternSources) == 0 {
+		mappedLibPatternGlobal.Store(nil)
+		return
+	}
+	union, err := regexp.Compile("(?:" + strings.Join(mappedLibPatternSources, ")|(?:") + ")")
+	if err != nil {
+		return
+	}
+	mappedLibPatternGlobal.Store(union)
+}
+
+// AddMappedLibPattern additively registers a basename matcher that arms the
+// Phase-3 map_files retry timer, alongside any previously registered pattern(s)
+// (from earlier AddMappedLibPattern or SetMappedLibPattern calls). Each
+// registered pattern's matches are OR'd together — the retry timer fires for a
+// candidate file matching ANY registered pattern. Call once per distinct
+// pattern, before any gadget is instantiated, mirroring
+// container-hook.SetExecEventsCollection. A nil pattern is a documented no-op
+// (no current caller passes nil here; this avoids a panic on pattern.String()
+// rather than silently accepting a meaningless call).
+func AddMappedLibPattern(pattern *regexp.Regexp) {
+	if pattern == nil {
+		return
+	}
+	mappedLibPatternMu.Lock()
+	defer mappedLibPatternMu.Unlock()
+	mappedLibPatternSources = append(mappedLibPatternSources, pattern.String())
+	recompileMappedLibPatternLocked()
+}
+
 // SetMappedLibPattern sets (or clears, with nil) the package-global basename
-// matcher that arms the Phase-3 map_files retry timer. It mirrors
+// matcher that arms the Phase-3 map_files retry timer, DISCARDING any patterns
+// previously registered via AddMappedLibPattern or a prior SetMappedLibPattern
+// call — this is the reset entry point, not an additive one (use
+// AddMappedLibPattern to register alongside existing patterns). It mirrors
 // container-hook.SetExecEventsCollection: node-agent calls it once at startup,
 // before any gadget is instantiated. Passing nil disables the feature.
+//
+// Behaviorally equivalent to the pre-additive-API version for a single caller
+// (same matching outcomes) — but NOT pointer-identical: Load() after Set(p) now
+// returns a freshly-compiled regex, never p itself. This is a real, deliberate
+// behavior change to this exported function, not an oversight.
 func SetMappedLibPattern(pattern *regexp.Regexp) {
-	mappedLibPatternGlobal.Store(pattern)
+	mappedLibPatternMu.Lock()
+	defer mappedLibPatternMu.Unlock()
+	if pattern == nil {
+		mappedLibPatternSources = nil
+	} else {
+		mappedLibPatternSources = []string{pattern.String()}
+	}
+	recompileMappedLibPatternLocked()
 }
 
 // mappedLibTimer is the per-pid retry-timer registry on the ebpfInstance. Its
