@@ -16,17 +16,9 @@ package ebpfoperator
 
 import "sync"
 
-// manualFetchSubscriber pairs a running map iterator's datasource name with the
-// channel its goroutine (see runMapIterators) is currently selecting on for
-// out-of-band fetch requests.
-type manualFetchSubscriber struct {
-	name string
-	ch   chan struct{}
-}
-
 var (
 	manualFetchMu   sync.Mutex
-	manualFetchSubs = map[*mapIter]manualFetchSubscriber{}
+	manualFetchSubs = map[string]map[*mapIter]chan struct{}{}
 )
 
 // registerManualFetch makes iter eligible to receive TriggerManualMapFetch requests
@@ -37,14 +29,23 @@ var (
 func registerManualFetch(iter *mapIter) <-chan struct{} {
 	ch := make(chan struct{}, 1)
 	manualFetchMu.Lock()
-	manualFetchSubs[iter] = manualFetchSubscriber{name: iter.name, ch: ch}
+	subs, ok := manualFetchSubs[iter.name]
+	if !ok {
+		subs = map[*mapIter]chan struct{}{}
+		manualFetchSubs[iter.name] = subs
+	}
+	subs[iter] = ch
 	manualFetchMu.Unlock()
 	return ch
 }
 
 func unregisterManualFetch(iter *mapIter) {
 	manualFetchMu.Lock()
-	delete(manualFetchSubs, iter)
+	subs := manualFetchSubs[iter.name]
+	delete(subs, iter)
+	if len(subs) == 0 {
+		delete(manualFetchSubs, iter.name)
+	}
 	manualFetchMu.Unlock()
 }
 
@@ -65,21 +66,20 @@ func unregisterManualFetch(iter *mapIter) {
 // gadget instance isn't running, or hasn't reached the point of registering its
 // iterators yet).
 func TriggerManualMapFetch(names ...string) {
-	filterByName := len(names) > 0
-	wanted := make(map[string]struct{}, len(names))
-	for _, n := range names {
-		wanted[n] = struct{}{}
-	}
-
 	manualFetchMu.Lock()
-	chans := make([]chan struct{}, 0, len(manualFetchSubs))
-	for _, sub := range manualFetchSubs {
-		if filterByName {
-			if _, ok := wanted[sub.name]; !ok {
-				continue
+	var chans []chan struct{}
+	if len(names) > 0 {
+		for _, n := range names {
+			for _, ch := range manualFetchSubs[n] {
+				chans = append(chans, ch)
 			}
 		}
-		chans = append(chans, sub.ch)
+	} else {
+		for _, subs := range manualFetchSubs {
+			for _, ch := range subs {
+				chans = append(chans, ch)
+			}
+		}
 	}
 	manualFetchMu.Unlock()
 
