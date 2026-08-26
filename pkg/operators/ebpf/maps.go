@@ -232,6 +232,10 @@ func (i *ebpfInstance) runMapIterators() error {
 			if iter.interval > 0 {
 				tickerChan = time.NewTicker(iter.interval).C
 			}
+
+			manualTrigger := registerManualFetch(iter)
+			defer unregisterManualFetch(iter)
+
 			for {
 				select {
 				case <-i.done:
@@ -247,6 +251,8 @@ func (i *ebpfInstance) runMapIterators() error {
 						// TODO: close DS
 						return
 					}
+				case <-manualTrigger:
+					fetch()
 				}
 			}
 		}()
